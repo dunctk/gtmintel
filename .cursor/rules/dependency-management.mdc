@@ -1,0 +1,100 @@
+---
+description: Guidelines for managing dependencies in a Leptos Rust project with workspace structure
+globs: *.toml
+alwaysApply: false
+---
+
+# Dependency Management in Leptos Project
+
+## Project Structure Overview
+
+This project follows a workspace structure with multiple crates:
+- **app**: Core Leptos application logic and UI components
+- **frontend**: Client-side WASM build for browser
+- **server**: Axum server with SSR and API endpoints
+
+## Dependency Management Methods
+
+### 1. Workspace Dependencies (Recommended)
+
+Use workspace dependencies for shared libraries that should maintain consistent versions across all crates:
+
+```toml
+# Root Cargo.toml
+[workspace]
+members = ["app", "frontend", "server"]
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+leptos = "0.7.3"
+sea-orm = { version = "0.12", features = ["sqlx-sqlite", "sqlx-postgres", "runtime-tokio-rustls", "macros"] }
+```
+
+Then in individual crate Cargo.toml files:
+
+```toml
+[dependencies]
+tokio.workspace = true
+leptos.workspace = true
+```
+
+**Note**: Never mix workspace dependencies with regular dependencies for the same package, as this will cause a duplicate key error.
+
+### 2. Regular Dependencies
+
+For crate-specific dependencies that are only needed in one place:
+
+```toml
+[dependencies]
+crate-specific-package = "1.0.0"
+```
+
+## Where to Add Dependencies
+
+- **Root Cargo.toml**: Add shared dependencies in `[workspace.dependencies]` section
+- **app/Cargo.toml**: UI components, view logic, and shared models
+- **frontend/Cargo.toml**: Browser/WASM-specific dependencies
+- **server/Cargo.toml**: Server-side dependencies including:
+  - Database (SeaORM)
+  - HTTP server (Axum)
+  - Authentication
+  - File handling
+
+## Database Configuration
+
+For our database setup:
+- We use **SeaORM** with both SQLite (local) and PostgreSQL (Supabase production)
+- Add SeaORM dependencies to the **server** crate, not in the app crate
+- Configure database connection in server/src/db/mod.rs
+
+## Examples by Crate
+
+### Root Cargo.toml
+```toml
+[workspace.dependencies]
+leptos = "0.7.3"
+tokio = { version = "1", features = ["full"] }
+```
+
+### server/Cargo.toml
+```toml
+[dependencies]
+tokio.workspace = true
+leptos.workspace = true
+axum = "0.7.0"
+sea-orm = { version = "0.12", features = ["sqlx-sqlite", "sqlx-postgres", "runtime-tokio-rustls", "macros"] }
+dotenv = "0.15.0"
+```
+
+### app/Cargo.toml
+```toml
+[dependencies]
+leptos.workspace = true
+```
+
+### frontend/Cargo.toml
+```toml
+[dependencies]
+leptos.workspace = true
+wasm-bindgen = "0.2"
+```

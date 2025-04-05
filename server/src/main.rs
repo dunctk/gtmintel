@@ -1,31 +1,31 @@
-use axum::Router;
-use leptos::prelude::*;
+mod db;
+mod fileserv;
+
+use axum::{Router, routing::get};
+use dotenv::dotenv;
+use leptos::*;
 use leptos_axum::{generate_route_list, LeptosRoutes};
-use app::*;
-use leptos::logging::log;
+use std::env;
 
 #[tokio::main]
 async fn main() {
-
-    let conf = get_configuration(None).unwrap();
-    let addr = conf.leptos_options.site_addr;
-    let leptos_options = conf.leptos_options;
-    // Generate the list of routes in your Leptos App
-    let routes = generate_route_list(App);
-
+    // Load environment variables from .env file
+    dotenv().ok();
+    
+    // Connect to the database
+    let db_conn = db::connect().await.expect("Failed to connect to database");
+    
+    // Existing Axum server setup
+    let leptos_options = LeptosOptions::builder().output_name("app").build();
+    
+    // Create a router with routes and database connection state
     let app = Router::new()
-        .leptos_routes(&leptos_options, routes, {
-            let leptos_options = leptos_options.clone();
-            move || shell(leptos_options.clone())
-        })
-        .fallback(leptos_axum::file_and_error_handler(shell))
-        .with_state(leptos_options);
-
-    // run our app with hyper
-    // `axum::Server` is a re-export of `hyper::Server`
-    log!("listening on http://{}", &addr);
-    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
-    axum::serve(listener, app.into_make_service())
+        .leptos_routes(&leptos_options, generate_route_list(app::App), app::App)
+        .with_state((leptos_options, db_conn)); // Add database connection to state
+    
+    // Start the server
+    axum::Server::bind(&"0.0.0.0:3000".parse().unwrap())
+        .serve(app.into_make_service())
         .await
         .unwrap();
 }
