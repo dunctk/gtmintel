@@ -16,3 +16,5 @@ tokio.workspace = true
 tower.workspace = true
 tower-http.workspace = true
 log.workspace = true
+sea-orm = { version = "0.12", features = ["sqlx-sqlite", "sqlx-postgres", "runtime-tokio-rustls", "macros"] }
+dotenv = "0.15"
