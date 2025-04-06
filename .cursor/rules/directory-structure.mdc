@@ -1,52 +1,7 @@
 ---
 description: 
 globs: 
-alwaysApply: true
+alwaysApply: false
 ---
 # For context, the current project structure is:
 
-.
-├── Cargo.lock
-├── Cargo.toml
-├── LICENSE
-├── README.md
-├── app
-│   ├── Cargo.toml
-│   └── src
-│       └── lib.rs
-├── end2end
-│   ├── package-lock.json
-│   ├── package.json
-│   ├── playwright.config.ts
-│   ├── tests
-│   │   └── example.spec.ts
-│   └── tsconfig.json
-├── frontend
-│   ├── Cargo.toml
-│   └── src
-│       └── lib.rs
-├── public
-│   └── favicon.ico
-├── server
-│   ├── Cargo.toml
-│   └── src
-│       ├── fileserv.rs
-│       └── main.rs
-├── style
-│   └── main.scss
-├── target
-│   ├── debug
-│   │   ├── build
-│   │   ├── deps
-│   │   ├── examples
-│   │   ├── incremental
-│   │   ├── server
-│   │   └── server.d
-│   ├── front
-│   │   ├── CACHEDIR.TAG
-│   │   ├── debug
-│   │   └── wasm32-unknown-unknown
-│   └── site
-│       ├── favicon.ico
-│       └── pkg
-└── update-dir-structure.sh

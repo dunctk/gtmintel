@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+
+{% block title %}Dashboard{% endblock %}
+
+{% block content %}
+    <h2>Welcome to the Dashboard</h2>
+    <p>This is the main content area.</p>
+
+    <div id="dynamic-content">
+        <p>Initial content.</p>
+    </div>
+
+    <button hx-get="/load-widget" hx-target="#dynamic-content" hx-swap="outerHTML">
+        Load Widget
+    </button>
+{% endblock %} 
