@@ -40,7 +40,7 @@ Key Features
 
     Dashboard & Report Generation:
 
-        Interface: Interactive, web-based dashboard built with Leptos 0.7.3.
+        Interface: Interactive, web-based dashboard built with Askama and HTMX.
 
         Output: Visual dashboards and downloadable reports with clear, actionable insights.
 
