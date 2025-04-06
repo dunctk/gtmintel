@@ -46,6 +46,6 @@ Key Features
 
     API & Integration Layer:
 
-        Framework: RESTful API endpoints built with Axum 0.7.
+        Framework: Axum 0.7 server side rendered Askama templates and HTMX. SCSS compiled to CSS using Turf.
 
         Purpose: Allow integration with external tools and easy access to aggregated data and insights.

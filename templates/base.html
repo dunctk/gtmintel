@@ -4,13 +4,13 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{% block title %}GTM Intelligence{% endblock %}</title>
-    <!-- Add CSS links here -->
-    <!-- <link rel="stylesheet" href="/static/css/style.css"> -->
+    <!-- Embed our compiled CSS -->
+    <style>{{ style_sheet|safe }}</style>
     <script src="/static/js/htmx.min.js"></script>
 </head>
-<body>
-    <header>
-        <h1>GTM Intelligence Platform</h1>
+<body class="{{ class_names.container }}">
+    <header class="{{ class_names.card }}">
+        <h1 class="{{ class_names.title }}">GTM Intelligence Platform</h1>
         <!-- Navigation etc. -->
     </header>
 
@@ -18,8 +18,8 @@
         {% block content %}{% endblock %}
     </main>
 
-    <footer>
-        <p>&copy; 2024 Your Company</p>
+    <footer class="{{ class_names.card }}">
+        <p class="{{ class_names.content }}">&copy; 2024 Your Company</p>
     </footer>
     <!-- Add JS links here -->
     <!-- <script src="/static/js/script.js"></script> -->
