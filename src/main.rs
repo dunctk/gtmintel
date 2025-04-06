@@ -20,10 +20,10 @@ async fn main() {
         .layer(TraceLayer::new_for_http());
 
     // Run it
-    let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
+    let addr = SocketAddr::from(([127, 0, 0, 1], 3001));
     tracing::debug!("listening on {}", addr);
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    axum::serve(listener, app.into_make_service())
+    axum::serve(listener, app)
         .await
         .unwrap();
 }

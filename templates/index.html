@@ -3,14 +3,16 @@
 {% block title %}Dashboard{% endblock %}
 
 {% block content %}
-    <h2>Welcome to the Dashboard</h2>
-    <p>This is the main content area.</p>
-
-    <div id="dynamic-content">
-        <p>Initial content.</p>
+    <div class="{{ class_names.card }}">
+        <h2 class="{{ class_names.title }}">Welcome to the Dashboard</h2>
+        <p class="{{ class_names.content }}">This is the main content area.</p>
     </div>
 
-    <button hx-get="/load-widget" hx-target="#dynamic-content" hx-swap="outerHTML">
+    <div id="dynamic-content" class="{{ class_names.card }}">
+        <p class="{{ class_names.content }}">Initial content.</p>
+    </div>
+
+    <button class="{{ class_names.button }}" hx-get="/load-widget" hx-target="#dynamic-content" hx-swap="outerHTML">
         Load Widget
     </button>
 {% endblock %} 
