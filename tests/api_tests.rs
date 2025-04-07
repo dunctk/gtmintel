@@ -1,0 +1,33 @@
+use axum::{
+    body::Body,
+    http::{Request, StatusCode},
+};
+use serde_json::Value;
+use tower::ServiceExt;
+use axum::body::to_bytes;
+
+#[tokio::test]
+async fn test_research_pages_scale() {
+    // Build our application
+    let app = marketintel_api::create_app();
+
+    // Create our test request
+    let request = Request::builder()
+        .uri("/research/pages?domain=scale.com")
+        .body(Body::empty())
+        .unwrap();
+
+    // Send the request and get response
+    let response = app.oneshot(request).await.unwrap();
+    
+    // Assert status is OK
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Get the response body (with a 1MB size limit)
+    let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+
+    // Assert the response structure and domain
+    assert_eq!(json["domain"], "scale.com");
+    assert!(json["new_pages_last_7_days"].is_number());
+} 

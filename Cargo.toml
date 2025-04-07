@@ -1,0 +1,22 @@
+[package]
+name = "marketintel-api"
+version = "0.1.0"
+edition = "2021"
+description = "API for company research and website analysis"
+
+[dependencies]
+axum = "0.7"
+tokio = { version = "1.0", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+utoipa = { version = "4.1", features = ["axum_extras"] }
+utoipa-swagger-ui = { version = "5.0", features = ["axum"] }
+tower-http = { version = "0.5", features = ["cors"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+tower = { version = "0.4", features = ["util"] }
+hyper = "1.0"
+
+[dev-dependencies]
+hyper = { version = "1.0", features = ["full"] }
+tower = { version = "0.4", features = ["util"] }

@@ -66,6 +66,7 @@ Develop a Rust-based backend service using the Axum framework. The service will 
 | API Docs         | `utoipa`              |
 | Swagger UI       | `utoipa-swagger-ui`   |
 | Schema Derivation| `utoipa::ToSchema`    |
+| Web crawler      | `spider`              |
 
 ---
 
