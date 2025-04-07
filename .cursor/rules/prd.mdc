@@ -3,49 +3,99 @@ description:
 globs: 
 alwaysApply: true
 ---
-Overview
+## 📄 Product Requirements Document (PRD)
 
-Develop a GTM intelligence platform that unifies B2B data, buying signals, and AI-driven insights into actionable intelligence. The MVP will target three niches: AI Trading Data (for work), Market Intelligence (for freelance/consulting), and Cybersecurity (new market for client acquisition).
-Objective
+### Title: Rust API for Company Research with Auto-Generated OpenAPI Docs
 
-    Primary Goal: Enable marketing and sales teams to identify, prioritize, and engage the right buyers through a unified, data-driven platform.
+---
 
-    Secondary Goal: Serve as a portfolio piece that demonstrates technical prowess in Rust-based development and effective GTM strategies.
+### 1. **Overview**
 
-Key Features
+Develop a Rust-based backend service using the Axum framework. The service will expose an API endpoint for company research purposes, specifically returning the number of new pages published on a company's website within the past 7 days. API documentation should be automatically generated and accessible via Swagger UI.
 
-    Data Aggregation Module:
+---
 
-        Function: Scrape and collect B2B data, including company profiles, contact information, and buying signals.
+### 2. **Goals**
 
-        Scope: Utilize Rust’s performance for concurrent scraping from targeted industry sources (news sites, forums, social media).
+- ✅ Build an endpoint to return the number of new web pages published in the last 7 days for a given domain.
+- ✅ Use Axum and Serde for request/response handling.
+- ✅ Integrate `utoipa` for automatic OpenAPI documentation generation.
+- ✅ Serve Swagger UI at `/docs`.
 
-    Data Analysis & Insights:
+---
 
-        Function: Process and analyze collected data to generate AI-driven recommendations.
+### 3. **Requirements**
 
-        Outcome: Highlight trends, competitor analysis, and actionable buyer insights.
+#### Functional
 
-    Industry-Specific Customization:
+- **Endpoint: `GET /research/pages`**
+  - **Query Parameters:**
+    - `domain` (string, required) – the domain name to analyze.
+  - **Response:**
+    ```json
+    {
+      "domain": "example.com",
+      "new_pages_last_7_days": 42
+    }
+    ```
+  - Data source can be mocked or stubbed for the first implementation.
+  - Later enhancement: support custom time ranges (e.g., `from`, `to` query parameters).
 
-        Modules:
+- **OpenAPI Documentation**
+  - Automatically generated using `utoipa`.
+  - Available in JSON format at `/api-doc/openapi.json`.
 
-            AI Trading Data insights
+- **Swagger UI**
+  - Mounted at `/docs` path.
 
-            Market Intelligence for marketing consultants
+#### Non-Functional
 
-            Cybersecurity insights for new client acquisition
+- Written in idiomatic, modular Rust.
+- Use `tokio` async runtime.
+- Easily extendable for future endpoints.
 
-        Approach: Filter and tailor data outputs based on the selected industry module.
+---
 
-    Dashboard & Report Generation:
+### 4. **Technical Stack**
 
-        Interface: Interactive, web-based dashboard built with Askama and HTMX.
+| Component        | Tool/Library          |
+|------------------|-----------------------|
+| Web Framework    | `axum`                |
+| Serialization    | `serde` + `serde_json`|
+| Async Runtime    | `tokio`               |
+| API Docs         | `utoipa`              |
+| Swagger UI       | `utoipa-swagger-ui`   |
+| Schema Derivation| `utoipa::ToSchema`    |
 
-        Output: Visual dashboards and downloadable reports with clear, actionable insights.
+---
 
-    API & Integration Layer:
+### 5. **Deliverables**
 
-        Framework: Axum 0.7 server side rendered Askama templates and HTMX. SCSS compiled to CSS using Turf.
+- [ ] **Initial endpoint** `/research/pages`:
+  - Accepts `domain` as query param.
+  - Returns mocked `new_pages_last_7_days` integer.
+- [ ] Auto-generated OpenAPI docs via `utoipa`.
+- [ ] Swagger UI served at `/docs`.
 
-        Purpose: Allow integration with external tools and easy access to aggregated data and insights.
+---
+
+### 6. **Milestones**
+
+| Milestone                                | Est. Time |
+|------------------------------------------|-----------|
+| Project setup & dependency configuration | 1 hour    |
+| Implement endpoint with mocked logic     | 1.5 hours |
+| Integrate utoipa + Swagger UI            | 1 hour    |
+| Testing & polish                         | 0.5 hour  |
+
+---
+
+### 7. **Future Scope**
+
+- Support custom time range (e.g., `from` and `to` query params).
+- Add additional company research endpoints (e.g., content change tracking, SEO metrics).
+- Connect to actual data source or crawler backend.
+- Add authentication and rate limiting.
+- Package for Docker deployment.
+- CI pipeline for automated testing and doc generation.
+
