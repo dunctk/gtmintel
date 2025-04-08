@@ -43,12 +43,30 @@ Get the number of new pages published in the last 7 days for a given domain.
 
 Query Parameters:
 - `domain` (required): The domain name to analyze (e.g., "example.com")
+- `within_days` (optional, default: 7): Number of days in the past to check.
+- `list_pages` (optional, default: false): Set to `true` to include the list of updated page URLs.
 
-Example Response:
+Example Response (without `list_pages=true`):
 ```json
 {
   "domain": "example.com",
-  "new_pages_last_7_days": 42
+  "updated_pages": 42,
+  "days_analyzed": 7,
+  "sitemap_url": "https://example.com/sitemap.xml"
+}
+```
+
+Example Response (with `list_pages=true`):
+```json
+{
+  "domain": "example.com",
+  "updated_pages": 2,
+  "days_analyzed": 7,
+  "sitemap_url": "https://example.com/sitemap.xml",
+  "updated_page_urls": [
+    "https://example.com/new-page-1",
+    "https://example.com/updated-blog-post"
+  ]
 }
 ```
 
