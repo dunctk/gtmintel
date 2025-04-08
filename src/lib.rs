@@ -311,39 +311,50 @@ pub fn create_app() -> Router {
     // Build our API documentation (needed regardless for ApiDoc::openapi())
     let api_doc = ApiDoc::openapi();
 
-    // --- Create our base router ---
-    // Make router mutable only if needed for conditional layers
-    #[cfg(not(test))]
-    let mut router = Router::new()
+    // --- Define API routes separately ---
+    // ✨ ADD ALL NEW API ROUTES HERE ✨
+    let api_routes = Router::new()
         .route("/research/pages/updated", get(research_pages))
-        .route("/health", get(health_check));
-
-    // Base router without layers for test builds
-    #[cfg(test)]
-    let router = Router::new()
-        .route("/research/pages/updated", get(research_pages))
-        .route("/health", get(health_check));
-
+        .route("/health", get(health_check)); // Decide if /health should be rate-limited too
+        // .route("/new/api/endpoint", get(new_handler)) // Example of adding a new route
 
     // --- Conditionally apply layers and Swagger UI only when NOT running tests ---
     #[cfg(not(test))]
-    {
-        // Merge Swagger UI
-        router = router.merge(SwaggerUi::new("/docs").url("/api-doc/openapi.json", api_doc));
+    let (docs_router, rate_limited_api_routes) = {
+        // Create Swagger UI router
+        let docs_router = SwaggerUi::new("/docs").url("/api-doc/openapi.json", api_doc);
 
         // Configure Rate Limiting
         let governor_conf = Arc::new(
             GovernorConfigBuilder::default()
                 .key_extractor(SmartIpKeyExtractor)
                 .period(std::time::Duration::from_secs(12))
-                .burst_size(NonZeroU32::new(2).unwrap().into())
+                .burst_size(NonZeroU32::new(5).unwrap().into())
                 .finish()
                 .unwrap(),
         );
-        router = router.layer(GovernorLayer { config: governor_conf }); // Apply Governor layer
+        // Apply Governor layer ONLY to the api_routes defined above
+        let rate_limited_api_routes = api_routes.layer(GovernorLayer { config: governor_conf });
 
-        // Apply CORS layer
-        router = router.layer(
+        (docs_router, rate_limited_api_routes)
+    };
+
+    // For test builds, use the original api_routes and an empty router for docs
+    #[cfg(test)]
+    let (docs_router, rate_limited_api_routes) = (Router::new(), api_routes);
+
+
+    // --- Build the final application router ---
+    // Start with the rate-limited API routes and merge the docs router
+    let mut app = Router::new()
+        .merge(rate_limited_api_routes) // Add rate-limited API routes
+        .merge(docs_router);            // Add documentation routes (not rate-limited)
+
+
+    // --- Apply CORS to the whole app (both API and docs) if needed ---
+    #[cfg(not(test))]
+    {
+        app = app.layer(
             CorsLayer::new()
                 .allow_origin(Any)
                 .allow_methods(Any)
@@ -351,6 +362,6 @@ pub fn create_app() -> Router {
         );
     }
 
-    // Return the router
-    router
+    // Return the final router
+    app
 } 
