@@ -20,6 +20,7 @@ sitemap = "0.4.1"
 texting_robots = "0.2.2"
 reqwest = { version = "0.11", features = ["json"] }
 chrono = "0.4"
+url = "2.5.4"
 
 [dev-dependencies]
 hyper = { version = "1.0", features = ["full"] }
