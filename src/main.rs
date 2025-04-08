@@ -1,4 +1,5 @@
 use marketintel_api::create_app;
+use std::net::SocketAddr;
 use tracing_subscriber;
 
 #[tokio::main]
@@ -10,5 +11,10 @@ async fn main() {
     let app = create_app();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await.unwrap();
     tracing::info!("Server running on http://127.0.0.1:3000");
-    axum::serve(listener, app).await.unwrap();
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .unwrap();
 }

@@ -15,7 +15,13 @@ use chrono::{Utc, Duration};
 use std::io::Cursor;
 use texting_robots::Robot;
 use std::collections::{VecDeque, HashSet};
-use url::Url;
+use tower_governor::{
+    governor::GovernorConfigBuilder,
+    key_extractor::SmartIpKeyExtractor,
+    GovernorLayer
+};
+use std::num::NonZeroU32;
+use std::sync::Arc;
 
 #[derive(Debug, Deserialize, ToSchema, IntoParams)]
 #[into_params(parameter_in = Query)]
@@ -210,7 +216,6 @@ async fn count_recent_pages(initial_sitemap_url: &str) -> Result<i32, Box<dyn Er
         for entity in parser {
             match entity {
                 SiteMapEntity::Url(url_entry) => {
-                    // Direct access to lastmod rather than Option unwrapping
                     match url_entry.lastmod {
                         LastMod::DateTime(last_mod_date) => {
                             let last_mod_utc = last_mod_date.with_timezone(&Utc);
@@ -256,10 +261,25 @@ pub fn create_app() -> Router {
     // Build our API documentation
     let api_doc = ApiDoc::openapi();
 
+    // --- Configure Rate Limiting using GovernorConfigBuilder ---
+    let governor_conf = Arc::new(
+        GovernorConfigBuilder::default()
+            .key_extractor(SmartIpKeyExtractor)
+            .period(std::time::Duration::from_secs(12))
+            .burst_size(NonZeroU32::new(2).unwrap().into())
+            .finish()
+            .unwrap(),
+    );
+
     // Create our router
     Router::new()
         .route("/research/pages", get(research_pages))
+        // Add more routes here if needed
         .merge(SwaggerUi::new("/docs").url("/api-doc/openapi.json", api_doc))
+        // --- Apply layers directly to the Router ---
+        .layer(GovernorLayer {
+            config: governor_conf,
+        })
         .layer(
             CorsLayer::new()
                 .allow_origin(Any)

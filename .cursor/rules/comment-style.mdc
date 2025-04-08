@@ -1,0 +1,47 @@
+---
+description: 
+globs: 
+alwaysApply: true
+---
+Writing good code comments involves explaining the why behind the code, which often includes describing the business goals or requirements that the code addresses. Here are some best practices to follow:
+Best Practices for Writing Good Code Comments
+
+    Explain the 'Why':
+
+        Comments should provide context and reasoning behind the code, not just describe what it does.
+
+        Explain the intent and purpose of the code, including any business goals or requirements it fulfills
+
+    .
+
+Keep It Concise:
+
+    Comments should be brief, clear, and focused on explaining the intent.
+
+    Avoid lengthy comments that repeat what the code already does
+
+    .
+
+Clarify Complex Code:
+
+    Use comments to break down complex logic and explain non-obvious code.
+
+    Highlight potential edge cases, performance considerations, or system limitations
+
+    .
+
+Connect to Business Logic:
+
+    Comments should connect the dots between code and business needs.
+
+    Explain how the code supports specific business objectives or user needs
+
+    .
+
+Use Clear Language:
+
+    Avoid technical jargon or complex terminology that might confuse team members.
+
+    Use simple, descriptive language to ensure readability
+
+.
