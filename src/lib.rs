@@ -14,6 +14,8 @@ use sitemap::structs::LastMod;
 use chrono::{Utc, Duration};
 use std::io::Cursor;
 use texting_robots::Robot;
+use std::collections::{VecDeque, HashSet};
+use url::Url;
 
 #[derive(Debug, Deserialize, ToSchema, IntoParams)]
 #[into_params(parameter_in = Query)]
@@ -157,51 +159,89 @@ async fn find_sitemap(domain: &str) -> Result<Option<String>, Box<dyn Error + Se
     Ok(None)
 }
 
-/// Count pages modified in the last 7 days from a sitemap
-async fn count_recent_pages(sitemap_url: &str) -> Result<i32, Box<dyn Error + Send + Sync>> {
-    // Fetch the sitemap
-    let sitemap_content = reqwest::get(sitemap_url).await?.bytes().await?;
-    
-    // Create a cursor for the sitemap content
-    let cursor = Cursor::new(sitemap_content);
-    
-    // Create sitemap reader
-    let parser = SiteMapReader::new(cursor);
-    
-    // Calculate the cutoff date (7 days ago)
+/// Count pages modified in the last 7 days from a sitemap URL, handling sitemap indexes.
+async fn count_recent_pages(initial_sitemap_url: &str) -> Result<i32, Box<dyn Error + Send + Sync>> {
+    let mut pages_counted = 0;
     let cutoff_date = Utc::now() - Duration::days(7);
-    let mut recent_pages = 0;
 
-    // Parse the sitemap
-    for entity in parser {
-        match entity {
-            SiteMapEntity::Url(url_entry) => {
-                let last_mod = url_entry.lastmod;
-                match last_mod {
-                    LastMod::DateTime(last_mod_date) => {
-                        let last_mod_utc = last_mod_date.with_timezone(&Utc);
-                        if last_mod_utc >= cutoff_date {
-                            recent_pages += 1;
-                        }
-                    },
-                    _ => {
-                        continue;
+    // Queue of sitemap URLs to process
+    let mut sitemap_queue: VecDeque<String> = VecDeque::new();
+    sitemap_queue.push_back(initial_sitemap_url.to_string());
+
+    // Set to track processed sitemaps to prevent infinite loops (if sitemaps reference each other)
+    let mut processed_sitemaps: HashSet<String> = HashSet::new();
+
+    while let Some(sitemap_url) = sitemap_queue.pop_front() {
+        // Avoid processing the same sitemap multiple times
+        if !processed_sitemaps.insert(sitemap_url.clone()) {
+            tracing::debug!("Skipping already processed sitemap: {}", sitemap_url);
+            continue;
+        }
+
+        tracing::info!("Processing sitemap: {}", sitemap_url);
+
+        // Fetch the sitemap content
+        let sitemap_response = match reqwest::get(&sitemap_url).await {
+             Ok(res) => res,
+             Err(e) => {
+                 tracing::error!("Failed to fetch sitemap {}: {}", sitemap_url, e);
+                 continue; // Skip this sitemap if fetch fails
+             }
+        };
+
+        if !sitemap_response.status().is_success() {
+            tracing::warn!("Failed to fetch sitemap {} - Status: {}", sitemap_url, sitemap_response.status());
+            continue; // Skip if status is not OK
+        }
+
+        let sitemap_content = match sitemap_response.bytes().await {
+             Ok(bytes) => bytes,
+             Err(e) => {
+                  tracing::error!("Failed to read bytes from sitemap {}: {}", sitemap_url, e);
+                  continue; // Skip if reading bytes fails
+             }
+        };
+
+        // Create a cursor and parser for the current sitemap's content
+        let cursor = Cursor::new(sitemap_content);
+        let parser = SiteMapReader::new(cursor);
+
+        // Process entities within the current sitemap
+        for entity in parser {
+            match entity {
+                SiteMapEntity::Url(url_entry) => {
+                    // Direct access to lastmod rather than Option unwrapping
+                    match url_entry.lastmod {
+                        LastMod::DateTime(last_mod_date) => {
+                            let last_mod_utc = last_mod_date.with_timezone(&Utc);
+                            if last_mod_utc >= cutoff_date {
+                                pages_counted += 1;
+                            }
+                        },
+                        _ => {} // Ignore other LastMod variants like Date
                     }
+                },
+                SiteMapEntity::SiteMap(sitemap_entry) => {
+                    // Extract the URL from the sitemap entry's location
+                    if let Some(nested_sitemap_url) = sitemap_entry.loc.get_url() {
+                        let nested_url_str = nested_sitemap_url.to_string();
+                        tracing::debug!("Found nested sitemap, adding to queue: {}", nested_url_str);
+                        // Add the nested sitemap URL to the queue for processing
+                        sitemap_queue.push_back(nested_url_str);
+                    } else {
+                         tracing::warn!("Sitemap entry location could not be resolved to a URL: {:?}", sitemap_entry.loc);
+                    }
+                },
+                SiteMapEntity::Err(error) => {
+                    tracing::warn!("Error parsing entity in {}: {}", sitemap_url, error);
+                    // Continue processing other entities in this sitemap
                 }
-            },
-            SiteMapEntity::SiteMap(_) => {
-                // For now, we're not recursively processing sitemap indexes
-                // TODO: Add support for sitemap index files
-                continue;
-            }
-            SiteMapEntity::Err(error) => {
-                tracing::warn!("Error parsing sitemap entity: {}", error);
-                continue;
             }
         }
-    }
+    } // End while loop
 
-    Ok(recent_pages)
+    tracing::info!("Finished processing. Found {} recent pages.", pages_counted);
+    Ok(pages_counted)
 }
 
 #[derive(OpenApi)]
