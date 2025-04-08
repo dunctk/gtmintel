@@ -30,4 +30,33 @@ async fn test_research_pages_scale() {
     // Assert the response structure and domain
     assert_eq!(json["domain"], "scale.com");
     assert!(json["new_pages_last_7_days"].is_number());
+    assert!(json.get("sitemap_url").is_some());
+}
+
+#[tokio::test]
+async fn test_research_pages_with_sitemap() {
+    let app = marketintel_api::create_app();
+
+    // Test with a domain known to have a sitemap
+    let request = Request::builder()
+        .uri("/research/pages?domain=rust-lang.org")
+        .body(Body::empty())
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+    
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(json["domain"], "rust-lang.org");
+    assert!(json["new_pages_last_7_days"].is_number());
+    assert!(json.get("sitemap_url").is_some());
+    
+    // If we found a sitemap, verify it's a valid URL
+    if let Some(sitemap_url) = json["sitemap_url"].as_str() {
+        assert!(sitemap_url.starts_with("http"));
+        assert!(sitemap_url.ends_with(".xml"));
+    }
 } 
