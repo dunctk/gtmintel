@@ -1,4 +1,4 @@
-use marketintel_api::create_app;
+use gtmintel::create_app;
 use std::net::SocketAddr;
 use tracing_subscriber;
 

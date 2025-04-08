@@ -9,7 +9,7 @@ use axum::body::to_bytes;
 #[tokio::test]
 async fn test_research_pages_scale() {
     // Build our application
-    let app = marketintel_api::create_app();
+    let app = gtmintel::create_app();
 
     // Create our test request
     let request = Request::builder()
@@ -35,7 +35,7 @@ async fn test_research_pages_scale() {
 
 #[tokio::test]
 async fn test_research_pages_with_sitemap() {
-    let app = marketintel_api::create_app();
+    let app = gtmintel::create_app();
 
     // Test with a domain known to have a sitemap
     let request = Request::builder()
