@@ -1,4 +1,6 @@
-# MarketIntel API
+# GTMintel API
+
+API for [gtmintel](https://gtmintel.com)
 
 A Rust-based API service for company research and website analysis.
 
