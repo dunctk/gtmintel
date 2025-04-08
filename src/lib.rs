@@ -3,6 +3,8 @@ use axum::{
     routing::get,
     Router,
     Json,
+    response::IntoResponse,
+    http::StatusCode,
 };
 use serde::{Deserialize, Serialize};
 use tower_http::cors::{CorsLayer, Any};
@@ -28,6 +30,10 @@ use std::sync::Arc;
 pub struct ResearchQuery {
     /// Domain name to analyze
     domain: String,
+    /// Optional: Set to true to include the list of new page URLs in the response. Defaults to false.
+    #[serde(default)] // Defaults to false if not present
+    #[param(required = false)] // Mark as optional for OpenAPI
+    list_pages: Option<bool>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -38,6 +44,9 @@ pub struct ResearchResponse {
     new_pages_last_7_days: i32,
     /// URL of the sitemap that was analyzed (if found)
     sitemap_url: Option<String>,
+    /// Optional: List of new page URLs found in the last 7 days (present if list_pages=true)
+    #[serde(skip_serializing_if = "Option::is_none")] // Don't include in JSON if None
+    new_pages: Option<Vec<String>>,
 }
 
 /// Get the number of new pages published in the last 7 days for a given domain
@@ -46,43 +55,56 @@ pub struct ResearchResponse {
     path = "/research/pages",
     params(ResearchQuery),
     responses(
-        (status = 200, description = "Success", body = ResearchResponse)
+        (status = 200, description = "Success, sitemap found and processed", body = ResearchResponse),
+        (status = 422, description = "Unprocessable Entity - Sitemap not found", body = ResearchResponse)
     )
 )]
-async fn research_pages(Query(query): Query<ResearchQuery>) -> Json<ResearchResponse> {
-    // Try to find the sitemap
+async fn research_pages(Query(query): Query<ResearchQuery>) -> impl IntoResponse {
     let sitemap_result = find_sitemap(&query.domain).await;
-    
-    let mut response = ResearchResponse {
-        domain: query.domain,
+
+    // Initialize response body with None for new_pages
+    let mut response_body = ResearchResponse {
+        domain: query.domain.clone(),
         new_pages_last_7_days: 0,
         sitemap_url: None,
+        new_pages: None, // Initialize as None
     };
 
-    // Process sitemap if found
+    // Determine if the user wants the list of pages
+    let should_list_pages = query.list_pages.unwrap_or(false);
+
     match sitemap_result {
         Ok(Some(sitemap_url)) => {
-            response.sitemap_url = Some(sitemap_url.clone());
+            response_body.sitemap_url = Some(sitemap_url.clone());
+            // Call updated function which returns (count, urls)
             match count_recent_pages(&sitemap_url).await {
-                Ok(count) => {
-                    response.new_pages_last_7_days = count;
+                // Destructure the result
+                Ok((count, urls)) => {
+                    response_body.new_pages_last_7_days = count;
+                    // Add the list to response only if requested
+                    if should_list_pages {
+                        response_body.new_pages = Some(urls);
+                    }
                     tracing::info!("Found {} new pages in sitemap", count);
+                    (StatusCode::OK, Json(response_body))
                 },
                 Err(e) => {
                     tracing::error!("Error counting pages from sitemap: {}", e);
-                    response.new_pages_last_7_days = 0;
+                    // Decide error handling (e.g., 500 or 200/0)
+                    // Let's keep 200/0 for now, list will be None
+                    (StatusCode::OK, Json(response_body))
                 }
             }
         },
         Ok(None) => {
             tracing::info!("No sitemap found");
+            (StatusCode::UNPROCESSABLE_ENTITY, Json(response_body))
         },
         Err(e) => {
             tracing::error!("Error finding sitemap: {}", e);
+            (StatusCode::UNPROCESSABLE_ENTITY, Json(response_body))
         }
     }
-
-    Json(response)
 }
 
 /// Attempts to find the sitemap URL for a given domain, checking robots.txt first, then common locations.
@@ -166,53 +188,45 @@ async fn find_sitemap(domain: &str) -> Result<Option<String>, Box<dyn Error + Se
 }
 
 /// Count pages modified in the last 7 days from a sitemap URL, handling sitemap indexes.
-async fn count_recent_pages(initial_sitemap_url: &str) -> Result<i32, Box<dyn Error + Send + Sync>> {
+/// Returns a tuple: (count, list_of_new_page_urls).
+async fn count_recent_pages(initial_sitemap_url: &str) -> Result<(i32, Vec<String>), Box<dyn Error + Send + Sync>> {
     let mut pages_counted = 0;
+    let mut new_page_urls: Vec<String> = Vec::new(); // Vector to store URLs
     let cutoff_date = Utc::now() - Duration::days(7);
 
-    // Queue of sitemap URLs to process
     let mut sitemap_queue: VecDeque<String> = VecDeque::new();
     sitemap_queue.push_back(initial_sitemap_url.to_string());
-
-    // Set to track processed sitemaps to prevent infinite loops (if sitemaps reference each other)
     let mut processed_sitemaps: HashSet<String> = HashSet::new();
 
     while let Some(sitemap_url) = sitemap_queue.pop_front() {
-        // Avoid processing the same sitemap multiple times
         if !processed_sitemaps.insert(sitemap_url.clone()) {
             tracing::debug!("Skipping already processed sitemap: {}", sitemap_url);
             continue;
         }
-
         tracing::info!("Processing sitemap: {}", sitemap_url);
 
-        // Fetch the sitemap content
         let sitemap_response = match reqwest::get(&sitemap_url).await {
-             Ok(res) => res,
-             Err(e) => {
-                 tracing::error!("Failed to fetch sitemap {}: {}", sitemap_url, e);
-                 continue; // Skip this sitemap if fetch fails
-             }
+            Ok(res) => res,
+            Err(e) => {
+                tracing::error!("Failed to fetch sitemap {}: {}", sitemap_url, e);
+                continue;
+            }
         };
-
         if !sitemap_response.status().is_success() {
             tracing::warn!("Failed to fetch sitemap {} - Status: {}", sitemap_url, sitemap_response.status());
-            continue; // Skip if status is not OK
+            continue;
         }
-
         let sitemap_content = match sitemap_response.bytes().await {
-             Ok(bytes) => bytes,
-             Err(e) => {
-                  tracing::error!("Failed to read bytes from sitemap {}: {}", sitemap_url, e);
-                  continue; // Skip if reading bytes fails
-             }
+            Ok(bytes) => bytes,
+            Err(e) => {
+                tracing::error!("Failed to read bytes from sitemap {}: {}", sitemap_url, e);
+                continue;
+            }
         };
 
-        // Create a cursor and parser for the current sitemap's content
         let cursor = Cursor::new(sitemap_content);
         let parser = SiteMapReader::new(cursor);
 
-        // Process entities within the current sitemap
         for entity in parser {
             match entity {
                 SiteMapEntity::Url(url_entry) => {
@@ -221,32 +235,34 @@ async fn count_recent_pages(initial_sitemap_url: &str) -> Result<i32, Box<dyn Er
                             let last_mod_utc = last_mod_date.with_timezone(&Utc);
                             if last_mod_utc >= cutoff_date {
                                 pages_counted += 1;
+                                // Add the URL to the list if it's recent
+                                if let Some(loc_url) = url_entry.loc.get_url() {
+                                    new_page_urls.push(loc_url.to_string());
+                                }
                             }
                         },
-                        _ => {} // Ignore other LastMod variants like Date
+                        _ => {}
                     }
                 },
                 SiteMapEntity::SiteMap(sitemap_entry) => {
-                    // Extract the URL from the sitemap entry's location
                     if let Some(nested_sitemap_url) = sitemap_entry.loc.get_url() {
                         let nested_url_str = nested_sitemap_url.to_string();
                         tracing::debug!("Found nested sitemap, adding to queue: {}", nested_url_str);
-                        // Add the nested sitemap URL to the queue for processing
                         sitemap_queue.push_back(nested_url_str);
                     } else {
-                         tracing::warn!("Sitemap entry location could not be resolved to a URL: {:?}", sitemap_entry.loc);
+                        tracing::warn!("Sitemap entry location could not be resolved to a URL: {:?}", sitemap_entry.loc);
                     }
                 },
                 SiteMapEntity::Err(error) => {
                     tracing::warn!("Error parsing entity in {}: {}", sitemap_url, error);
-                    // Continue processing other entities in this sitemap
                 }
             }
         }
-    } // End while loop
+    }
 
     tracing::info!("Finished processing. Found {} recent pages.", pages_counted);
-    Ok(pages_counted)
+    // Return both the count and the list of URLs
+    Ok((pages_counted, new_page_urls))
 }
 
 #[derive(OpenApi)]
