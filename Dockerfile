@@ -1,14 +1,11 @@
 # -------------------------------------------------------
 # 1) Base image with Rust + cargo-chef
-#    We'll install the `aarch64-unknown-linux-musl` target
 # -------------------------------------------------------
 FROM rust:1.84 AS chef
 WORKDIR /app
 
-# Install cargo-chef (for caching) and musl tools (for static linking)
+# Install cargo-chef (for caching)
 RUN cargo install cargo-chef
-RUN apt-get update && apt-get install -y musl-tools && rm -rf /var/lib/apt/lists/*
-RUN rustup target add aarch64-unknown-linux-musl
 
 # -------------------------------------------------------
 # 2) Planner stage: create the "recipe.json" for caching
@@ -23,28 +20,45 @@ RUN cargo chef prepare --recipe-path recipe.json
 FROM chef AS builder
 WORKDIR /app
 
+# Install OpenSSL development headers before building (needed for dynamic linking)
+RUN apt-get update && apt-get install -y --no-install-recommends libssl-dev pkg-config && \
+    rm -rf /var/lib/apt/lists/*
+
 # Copy the recipe from the planner
 COPY --from=planner /app/recipe.json recipe.json
 
 # 3A) Cargo Chef to cache dependencies (build them once)
-RUN cargo chef cook --release --target aarch64-unknown-linux-musl --recipe-path recipe.json
+RUN cargo chef cook --release --recipe-path recipe.json
 
 # 3B) Now copy the actual source code and build our final binary
 COPY . .
-RUN cargo build --release --target aarch64-unknown-linux-musl
+RUN cargo build --release
 
 # -------------------------------------------------------
-# 4) Final stage with a *minimal* image
-#    Since it's fully static, you can use FROM scratch
-#    or a small base like alpine if you want a shell
+# 4) Final stage with a *minimal* Debian image
+#    This includes glibc and libssl, so we don't need a static binary.
 # -------------------------------------------------------
-FROM scratch AS runtime
+FROM debian:stable-slim AS runtime
+# Use the architecture of your builder image (e.g., aarch64 or amd64)
+# Adjust TARGET_ARCH and TARGET_FOLDER if your base image architecture differs.
+ARG TARGET_ARCH=aarch64
+ARG TARGET_FOLDER=${TARGET_ARCH}-unknown-linux-gnu
+WORKDIR /app
 
-# Copy our statically-linked binary from builder
-COPY --from=builder /app/target/aarch64-unknown-linux-musl/release/gtmintel /gtmintel
+# Copy dynamically-linked binary from builder (update path)
+COPY --from=builder /app/target/${TARGET_FOLDER}/release/gtmintel /app/gtmintel
 
 # Copy the static directory for serving static files
-COPY --from=builder /app/static /static
+COPY --from=builder /app/static /app/static
+
+# Update package lists and install runtime libs
+# This ensures libssl.so.3 (or similar) and certificates are present
+RUN apt-get update && apt-get install -y --no-install-recommends libssl3 ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+# Create and switch to a non-root user (recommended)
+RUN groupadd --system appuser && useradd --system --gid appuser --no-create-home appuser
+USER appuser
 
 # (Optional) If you do want to run as a non-root user, you can switch to Alpine:
 # FROM alpine:3.17 AS runtime
@@ -52,11 +66,13 @@ COPY --from=builder /app/static /static
 # USER appuser
 
 # Environment
-ENV ROCKET_ADDRESS=0.0.0.0
-ENV ROCKET_PORT=8000
+# Set PORT (common convention) instead of ROCKET_* unless specifically needed
+# ENV ROCKET_ADDRESS=0.0.0.0
+# ENV ROCKET_PORT=8000
+ENV PORT=8000
 
-# Expose the Rocket port
+# Expose the application port
 EXPOSE 8000
 
-# Run the binary!
-CMD ["/gtmintel"]
+# Run the binary! (update path)
+CMD ["/app/gtmintel"]
