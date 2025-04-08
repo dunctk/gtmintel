@@ -40,16 +40,16 @@ pub struct ResearchQuery {
 pub struct ResearchResponse {
     /// Domain that was analyzed
     domain: String,
-    /// Number of new pages found in the last 7 days
-    new_pages_last_7_days: i32,
+    /// Number of pages updated in the last 7 days
+    updated_pages_last_7_days: i32,
     /// URL of the sitemap that was analyzed (if found)
     sitemap_url: Option<String>,
-    /// Optional: List of new page URLs found in the last 7 days (present if list_pages=true)
-    #[serde(skip_serializing_if = "Option::is_none")] // Don't include in JSON if None
-    new_pages: Option<Vec<String>>,
+    /// Optional: List of URLs for pages updated in the last 7 days (present if list_pages=true)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    updated_page_urls: Option<Vec<String>>,
 }
 
-/// Get the number of new pages published in the last 7 days for a given domain
+/// Get the number of pages updated in the last 7 days for a given domain
 #[utoipa::path(
     get,
     path = "/research/pages",
@@ -62,36 +62,30 @@ pub struct ResearchResponse {
 async fn research_pages(Query(query): Query<ResearchQuery>) -> impl IntoResponse {
     let sitemap_result = find_sitemap(&query.domain).await;
 
-    // Initialize response body with None for new_pages
+    // Initialize response body with updated field names
     let mut response_body = ResearchResponse {
         domain: query.domain.clone(),
-        new_pages_last_7_days: 0,
+        updated_pages_last_7_days: 0,
         sitemap_url: None,
-        new_pages: None, // Initialize as None
+        updated_page_urls: None,
     };
 
-    // Determine if the user wants the list of pages
     let should_list_pages = query.list_pages.unwrap_or(false);
 
     match sitemap_result {
         Ok(Some(sitemap_url)) => {
             response_body.sitemap_url = Some(sitemap_url.clone());
-            // Call updated function which returns (count, urls)
             match count_recent_pages(&sitemap_url).await {
-                // Destructure the result
                 Ok((count, urls)) => {
-                    response_body.new_pages_last_7_days = count;
-                    // Add the list to response only if requested
+                    response_body.updated_pages_last_7_days = count;
                     if should_list_pages {
-                        response_body.new_pages = Some(urls);
+                        response_body.updated_page_urls = Some(urls);
                     }
-                    tracing::info!("Found {} new pages in sitemap", count);
+                    tracing::info!("Found {} recently updated pages in sitemap", count);
                     (StatusCode::OK, Json(response_body))
                 },
                 Err(e) => {
                     tracing::error!("Error counting pages from sitemap: {}", e);
-                    // Decide error handling (e.g., 500 or 200/0)
-                    // Let's keep 200/0 for now, list will be None
                     (StatusCode::OK, Json(response_body))
                 }
             }
@@ -188,10 +182,10 @@ async fn find_sitemap(domain: &str) -> Result<Option<String>, Box<dyn Error + Se
 }
 
 /// Count pages modified in the last 7 days from a sitemap URL, handling sitemap indexes.
-/// Returns a tuple: (count, list_of_new_page_urls).
+/// Returns a tuple: (count, list_of_updated_page_urls).
 async fn count_recent_pages(initial_sitemap_url: &str) -> Result<(i32, Vec<String>), Box<dyn Error + Send + Sync>> {
     let mut pages_counted = 0;
-    let mut new_page_urls: Vec<String> = Vec::new(); // Vector to store URLs
+    let mut updated_page_urls: Vec<String> = Vec::new();
     let cutoff_date = Utc::now() - Duration::days(7);
 
     let mut sitemap_queue: VecDeque<String> = VecDeque::new();
@@ -235,9 +229,8 @@ async fn count_recent_pages(initial_sitemap_url: &str) -> Result<(i32, Vec<Strin
                             let last_mod_utc = last_mod_date.with_timezone(&Utc);
                             if last_mod_utc >= cutoff_date {
                                 pages_counted += 1;
-                                // Add the URL to the list if it's recent
                                 if let Some(loc_url) = url_entry.loc.get_url() {
-                                    new_page_urls.push(loc_url.to_string());
+                                    updated_page_urls.push(loc_url.to_string());
                                 }
                             }
                         },
@@ -260,9 +253,9 @@ async fn count_recent_pages(initial_sitemap_url: &str) -> Result<(i32, Vec<Strin
         }
     }
 
-    tracing::info!("Finished processing. Found {} recent pages.", pages_counted);
+    tracing::info!("Finished processing. Found {} recently updated pages.", pages_counted);
     // Return both the count and the list of URLs
-    Ok((pages_counted, new_page_urls))
+    Ok((pages_counted, updated_page_urls))
 }
 
 #[derive(OpenApi)]
