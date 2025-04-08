@@ -1,5 +1,7 @@
 # GTMintel API
 
+[OpenAPI Specification](https://api.gtmintel.com/api-doc/openapi.json)
+
 API for [gtmintel](https://gtmintel.com)
 
 A Rust-based API service for company research and website analysis.
