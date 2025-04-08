@@ -46,8 +46,7 @@ WORKDIR /app
 # Copy dynamically-linked binary from the standard release location in the builder stage
 COPY --from=builder /app/target/release/gtmintel /app/gtmintel
 
-# Copy the static directory for serving static files
-COPY --from=builder /app/static /app/static
+
 
 # Update package lists and install runtime libs
 # This ensures libssl.so.3 (or similar) and certificates are present
