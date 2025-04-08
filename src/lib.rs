@@ -30,26 +30,37 @@ use std::sync::Arc;
 pub struct ResearchQuery {
     /// Domain name to analyze
     domain: String,
-    /// Optional: Set to true to include the list of new page URLs in the response. Defaults to false.
-    #[serde(default)] // Defaults to false if not present
-    #[param(required = false)] // Mark as optional for OpenAPI
+    /// Optional: Set to true to include the list of updated page URLs in the response. Defaults to false.
+    #[serde(default)]
+    #[param(required = false)]
     list_pages: Option<bool>,
+    /// Optional: Number of days in the past to check for updated pages. Defaults to 7.
+    #[serde(default = "default_within_days")] // Use a function for default
+    #[param(required = false)]
+    within_days: u32,
+}
+
+// Function to provide the default value for within_days
+fn default_within_days() -> u32 {
+    7
 }
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ResearchResponse {
     /// Domain that was analyzed
     domain: String,
-    /// Number of pages updated in the last 7 days
-    updated_pages_last_7_days: i32,
+    /// Number of pages updated within the specified period
+    updated_pages: i32,
+    /// Number of days analyzed (period in the past)
+    days_analyzed: u32,
     /// URL of the sitemap that was analyzed (if found)
     sitemap_url: Option<String>,
-    /// Optional: List of URLs for pages updated in the last 7 days (present if list_pages=true)
+    /// Optional: List of URLs for pages updated within the specified period (present if list_pages=true)
     #[serde(skip_serializing_if = "Option::is_none")]
     updated_page_urls: Option<Vec<String>>,
 }
 
-/// Get the number of pages updated in the last 7 days for a given domain
+/// Get the number of pages updated within a specified number of days for a given domain
 #[utoipa::path(
     get,
     path = "/research/pages/updated",
@@ -62,10 +73,14 @@ pub struct ResearchResponse {
 async fn research_pages(Query(query): Query<ResearchQuery>) -> impl IntoResponse {
     let sitemap_result = find_sitemap(&query.domain).await;
 
-    // Initialize response body with updated field names
+    // Use the provided or default 'within_days' value
+    let days_to_analyze = query.within_days;
+
+    // Initialize response body with updated field names and days_analyzed
     let mut response_body = ResearchResponse {
         domain: query.domain.clone(),
-        updated_pages_last_7_days: 0,
+        updated_pages: 0,
+        days_analyzed: days_to_analyze,
         sitemap_url: None,
         updated_page_urls: None,
     };
@@ -75,13 +90,13 @@ async fn research_pages(Query(query): Query<ResearchQuery>) -> impl IntoResponse
     match sitemap_result {
         Ok(Some(sitemap_url)) => {
             response_body.sitemap_url = Some(sitemap_url.clone());
-            match count_recent_pages(&sitemap_url).await {
+            match count_recent_pages(&sitemap_url, days_to_analyze).await {
                 Ok((count, urls)) => {
-                    response_body.updated_pages_last_7_days = count;
+                    response_body.updated_pages = count;
                     if should_list_pages {
                         response_body.updated_page_urls = Some(urls);
                     }
-                    tracing::info!("Found {} recently updated pages in sitemap", count);
+                    tracing::info!("Found {} pages updated within {} days in sitemap", count, days_to_analyze);
                     (StatusCode::OK, Json(response_body))
                 },
                 Err(e) => {
@@ -181,12 +196,14 @@ async fn find_sitemap(domain: &str) -> Result<Option<String>, Box<dyn Error + Se
     Ok(None)
 }
 
-/// Count pages modified in the last 7 days from a sitemap URL, handling sitemap indexes.
+/// Count pages modified within the last `days` from a sitemap URL, handling sitemap indexes.
 /// Returns a tuple: (count, list_of_updated_page_urls).
-async fn count_recent_pages(initial_sitemap_url: &str) -> Result<(i32, Vec<String>), Box<dyn Error + Send + Sync>> {
+async fn count_recent_pages(initial_sitemap_url: &str, days: u32) -> Result<(i32, Vec<String>), Box<dyn Error + Send + Sync>> {
     let mut pages_counted = 0;
     let mut updated_page_urls: Vec<String> = Vec::new();
-    let cutoff_date = Utc::now() - Duration::days(7);
+    // Calculate the cutoff date based on the 'days' parameter
+    // Convert days (u32) safely to i64 for Duration::days
+    let cutoff_date = Utc::now() - Duration::days(days as i64);
 
     let mut sitemap_queue: VecDeque<String> = VecDeque::new();
     sitemap_queue.push_back(initial_sitemap_url.to_string());
@@ -227,6 +244,7 @@ async fn count_recent_pages(initial_sitemap_url: &str) -> Result<(i32, Vec<Strin
                     match url_entry.lastmod {
                         LastMod::DateTime(last_mod_date) => {
                             let last_mod_utc = last_mod_date.with_timezone(&Utc);
+                            // Use the calculated cutoff_date
                             if last_mod_utc >= cutoff_date {
                                 pages_counted += 1;
                                 if let Some(loc_url) = url_entry.loc.get_url() {
@@ -253,8 +271,8 @@ async fn count_recent_pages(initial_sitemap_url: &str) -> Result<(i32, Vec<Strin
         }
     }
 
-    tracing::info!("Finished processing. Found {} recently updated pages.", pages_counted);
-    // Return both the count and the list of URLs
+    // Update log message to be generic
+    tracing::info!("Finished processing. Found {} pages updated within the last {} days.", pages_counted, days);
     Ok((pages_counted, updated_page_urls))
 }
 
