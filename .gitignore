@@ -15,3 +15,5 @@ playwright/.cache/
 *.sqlite
 
 domain_name_ideas.txt
+
+.env
