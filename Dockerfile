@@ -58,10 +58,10 @@ RUN groupadd --system appuser && useradd --system --gid appuser --no-create-home
 USER appuser
 
 # Environment
-ENV PORT=8000
+ENV PORT=3000
 
 # Expose the application port
-EXPOSE 8000
+EXPOSE 3000
 
 # Run the binary! (ensure path matches the COPY destination)
 CMD ["/app/gtmintel"]
