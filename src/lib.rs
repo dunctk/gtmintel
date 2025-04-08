@@ -13,6 +13,7 @@ use sitemap::reader::{SiteMapReader, SiteMapEntity};
 use sitemap::structs::LastMod;
 use chrono::{Utc, Duration};
 use std::io::Cursor;
+use texting_robots::Robot;
 
 #[derive(Debug, Deserialize, ToSchema, IntoParams)]
 #[into_params(parameter_in = Query)]
@@ -76,32 +77,83 @@ async fn research_pages(Query(query): Query<ResearchQuery>) -> Json<ResearchResp
     Json(response)
 }
 
-/// Attempts to find the sitemap URL for a given domain
+/// Attempts to find the sitemap URL for a given domain, checking robots.txt first, then common locations.
 async fn find_sitemap(domain: &str) -> Result<Option<String>, Box<dyn Error + Send + Sync>> {
-    // Ensure domain has protocol
-    let domain = if !domain.starts_with("http") {
+    // Ensure domain has protocol and no trailing slash
+    let base_url = if !domain.starts_with("http") {
         format!("https://{}", domain)
     } else {
-        domain.to_string()
+        // Remove potential trailing slash for consistent URL building
+        domain.trim_end_matches('/').to_string()
     };
 
-    // Try common sitemap locations
-    let sitemap_urls = vec![
-        format!("{}/sitemap.xml", domain),
-        format!("{}/sitemap_index.xml", domain),
-        format!("{}/sitemap/sitemap.xml", domain),
-    ];
+    // 1. Try fetching and parsing robots.txt
+    let robots_url = format!("{}/robots.txt", base_url);
+    tracing::info!("Attempting to fetch robots.txt from: {}", robots_url);
 
-    // Try each possible sitemap URL
-    for url in sitemap_urls {
-        match reqwest::get(&url).await {
-            Ok(response) if response.status().is_success() => {
-                return Ok(Some(url));
+    match reqwest::get(&robots_url).await {
+        Ok(response) => {
+            if response.status().is_success() {
+                match response.text().await {
+                    Ok(content) => {
+                        // Use Robot::new with a user-agent and the content bytes
+                        match Robot::new("*", content.as_bytes()) {
+                            Ok(robot) => {
+                                // Check the sitemaps field
+                                if let Some(sitemap_url) = robot.sitemaps.first() {
+                                    tracing::info!("Found sitemap in robots.txt: {}", sitemap_url);
+                                    return Ok(Some(sitemap_url.clone()));
+                                } else {
+                                    tracing::info!("No sitemaps listed in robots.txt.");
+                                }
+                            }
+                            Err(e) => {
+                                // Log parsing error but continue to guessing
+                                tracing::warn!("Failed to parse robots.txt ({}): {}", robots_url, e);
+                            }
+                        }
+                    },
+                    Err(e) => {
+                         // Log text extraction error but continue to guessing
+                         tracing::warn!("Failed to read robots.txt content ({}): {}", robots_url, e);
+                    }
+                }
+            } else {
+                tracing::info!("robots.txt request failed or not found ({} - Status: {})", robots_url, response.status());
             }
-            _ => continue,
+        }
+        Err(e) => {
+            // Log fetch error but continue to guessing
+            tracing::warn!("Error fetching robots.txt ({}): {}", robots_url, e);
         }
     }
 
+    // 2. If robots.txt didn't yield a sitemap, try common locations (fallback)
+    tracing::info!("Falling back to guessing common sitemap locations for {}", base_url);
+    let sitemap_guesses = vec![
+        format!("{}/sitemap.xml", base_url),
+        format!("{}/sitemap_index.xml", base_url),
+        format!("{}/sitemap/sitemap.xml", base_url), // Kept this common guess
+    ];
+
+    for url in sitemap_guesses {
+        // Use HEAD request to check existence efficiently without downloading the body
+        match reqwest::Client::new().head(&url).send().await {
+            Ok(response) if response.status().is_success() => {
+                tracing::info!("Found sitemap by guessing: {}", url);
+                return Ok(Some(url)); // Return the guess URL
+            }
+            Ok(response) => {
+                tracing::debug!("Guess failed for {}: Status {}", url, response.status());
+            }
+            Err(e) => {
+                 tracing::debug!("Error checking guess {}: {}", url, e);
+            }
+        }
+    }
+
+    // 3. If neither method worked, return None
+    tracing::info!("Could not find sitemap for {} via robots.txt or common locations.", domain);
     Ok(None)
 }
 
