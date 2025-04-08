@@ -52,7 +52,7 @@ pub struct ResearchResponse {
 /// Get the number of pages updated in the last 7 days for a given domain
 #[utoipa::path(
     get,
-    path = "/research/pages",
+    path = "/research/pages/updated",
     params(ResearchQuery),
     responses(
         (status = 200, description = "Success, sitemap found and processed", body = ResearchResponse),
@@ -282,7 +282,7 @@ pub fn create_app() -> Router {
 
     // Create our router
     Router::new()
-        .route("/research/pages", get(research_pages))
+        .route("/research/pages/updated", get(research_pages))
         // Add more routes here if needed
         .merge(SwaggerUi::new("/docs").url("/api-doc/openapi.json", api_doc))
         // --- Apply layers directly to the Router ---
