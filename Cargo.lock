@@ -521,6 +521,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "gtmintel"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "chrono",
+ "hyper 1.6.0",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sitemap",
+ "texting_robots",
+ "tokio",
+ "tower",
+ "tower-http",
+ "tower_governor",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "utoipa",
+ "utoipa-swagger-ui",
+]
+
+[[package]]
 name = "h2"
 version = "0.3.26"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -953,29 +976,6 @@ name = "log"
 version = "0.4.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13dc2df351e3202783a1fe0d44375f7295ffb4049267b0f3018346dc122a1d94"
-
-[[package]]
-name = "marketintel-api"
-version = "0.1.0"
-dependencies = [
- "axum",
- "chrono",
- "hyper 1.6.0",
- "reqwest",
- "serde",
- "serde_json",
- "sitemap",
- "texting_robots",
- "tokio",
- "tower",
- "tower-http",
- "tower_governor",
- "tracing",
- "tracing-subscriber",
- "url",
- "utoipa",
- "utoipa-swagger-ui",
-]
 
 [[package]]
 name = "matchit"

@@ -1,5 +1,5 @@
 [package]
-name = "marketintel-api"
+name = "gtmintel"
 version = "0.1.0"
 edition = "2021"
 description = "API for company research and website analysis"
