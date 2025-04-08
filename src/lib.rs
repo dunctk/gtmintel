@@ -6,10 +6,14 @@ use axum::{
     response::IntoResponse,
     http::StatusCode,
 };
+// Conditionally import SwaggerUi only when needed (not test)
+#[cfg(not(test))]
+use utoipa_swagger_ui::SwaggerUi;
 use serde::{Deserialize, Serialize};
+// Conditionally import CORS only when needed (not test)
+#[cfg(not(test))]
 use tower_http::cors::{CorsLayer, Any};
 use utoipa::{OpenApi, ToSchema, IntoParams};
-use utoipa_swagger_ui::SwaggerUi;
 use std::error::Error;
 use sitemap::reader::{SiteMapReader, SiteMapEntity};
 use sitemap::structs::LastMod;
@@ -17,12 +21,16 @@ use chrono::{Utc, Duration};
 use std::io::Cursor;
 use texting_robots::Robot;
 use std::collections::{VecDeque, HashSet};
+// Conditionally import Governor only when needed (not test)
+#[cfg(not(test))]
 use tower_governor::{
     governor::GovernorConfigBuilder,
     key_extractor::SmartIpKeyExtractor,
     GovernorLayer
 };
+#[cfg(not(test))]
 use std::num::NonZeroU32;
+#[cfg(not(test))]
 use std::sync::Arc;
 
 #[derive(Debug, Deserialize, ToSchema, IntoParams)]
@@ -276,41 +284,73 @@ async fn count_recent_pages(initial_sitemap_url: &str, days: u32) -> Result<(i32
     Ok((pages_counted, updated_page_urls))
 }
 
+/// Health check endpoint - Simplified Return Type
+#[utoipa::path(
+    get,
+    path = "/health",
+    responses(
+        (status = 200, description = "Service is healthy")
+    )
+)]
+async fn health_check() -> StatusCode { // Return StatusCode directly
+    StatusCode::OK
+}
+
 #[derive(OpenApi)]
 #[openapi(
-    paths(research_pages),
+    paths(
+        research_pages,
+        health_check
+    ),
     components(schemas(ResearchQuery, ResearchResponse))
 )]
 struct ApiDoc;
 
 /// Create the application with all routes and middleware
 pub fn create_app() -> Router {
-    // Build our API documentation
+    // Build our API documentation (needed regardless for ApiDoc::openapi())
     let api_doc = ApiDoc::openapi();
 
-    // --- Configure Rate Limiting using GovernorConfigBuilder ---
-    let governor_conf = Arc::new(
-        GovernorConfigBuilder::default()
-            .key_extractor(SmartIpKeyExtractor)
-            .period(std::time::Duration::from_secs(12))
-            .burst_size(NonZeroU32::new(2).unwrap().into())
-            .finish()
-            .unwrap(),
-    );
-
-    // Create our router
-    Router::new()
+    // --- Create our base router ---
+    // Make router mutable only if needed for conditional layers
+    #[cfg(not(test))]
+    let mut router = Router::new()
         .route("/research/pages/updated", get(research_pages))
-        // Add more routes here if needed
-        .merge(SwaggerUi::new("/docs").url("/api-doc/openapi.json", api_doc))
-        // --- Apply layers directly to the Router ---
-        .layer(GovernorLayer {
-            config: governor_conf,
-        })
-        .layer(
+        .route("/health", get(health_check));
+
+    // Base router without layers for test builds
+    #[cfg(test)]
+    let router = Router::new()
+        .route("/research/pages/updated", get(research_pages))
+        .route("/health", get(health_check));
+
+
+    // --- Conditionally apply layers and Swagger UI only when NOT running tests ---
+    #[cfg(not(test))]
+    {
+        // Merge Swagger UI
+        router = router.merge(SwaggerUi::new("/docs").url("/api-doc/openapi.json", api_doc));
+
+        // Configure Rate Limiting
+        let governor_conf = Arc::new(
+            GovernorConfigBuilder::default()
+                .key_extractor(SmartIpKeyExtractor)
+                .period(std::time::Duration::from_secs(12))
+                .burst_size(NonZeroU32::new(2).unwrap().into())
+                .finish()
+                .unwrap(),
+        );
+        router = router.layer(GovernorLayer { config: governor_conf }); // Apply Governor layer
+
+        // Apply CORS layer
+        router = router.layer(
             CorsLayer::new()
                 .allow_origin(Any)
                 .allow_methods(Any)
                 .allow_headers(Any),
-        )
+        );
+    }
+
+    // Return the router
+    router
 } 

@@ -5,10 +5,12 @@ use axum::{
 use serde_json::Value;
 use tower::ServiceExt;
 use axum::body::to_bytes;
+use axum::extract::connect_info::MockConnectInfo;
+use std::net::SocketAddr;
 
 #[tokio::test]
 async fn test_research_pages_scale() {
-    // Build our application
+    // Build our application using the correct crate name
     let app = gtmintel::create_app();
 
     // Create our test request
@@ -35,6 +37,7 @@ async fn test_research_pages_scale() {
 
 #[tokio::test]
 async fn test_research_pages_with_sitemap() {
+    // Build our application using the correct crate name
     let app = gtmintel::create_app();
 
     // Test with a domain known to have a sitemap
@@ -59,4 +62,26 @@ async fn test_research_pages_with_sitemap() {
         assert!(sitemap_url.starts_with("http"));
         assert!(sitemap_url.ends_with(".xml"));
     }
-} 
+}
+
+#[tokio::test]
+async fn test_health_check() {
+    // Build our application using the correct crate name
+    let app = gtmintel::create_app();
+
+    // Define a mock address
+    let addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+
+    // Create our test request
+    let request = Request::builder()
+        .uri("/health")
+        .extension(MockConnectInfo(addr))
+        .body(Body::empty())
+        .unwrap();
+
+    // Send the request and get response
+    let response = app.oneshot(request).await.unwrap();
+
+    // Assert status is OK
+    assert_eq!(response.status(), StatusCode::OK);
+}
