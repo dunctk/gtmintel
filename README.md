@@ -1,8 +1,8 @@
-# GTMintel API
+# GTM INTEL API
 
-[OpenAPI Specification](https://api.gtmintel.com/api-doc/openapi.json)
+[**API Docs**](https://api.gtmintel.com/docs/) | [**OpenAPI Specification (JSON)**](https://api.gtmintel.com/api-doc/openapi.json)
 
-API for [gtmintel](https://gtmintel.com)
+API for [GTM INTEL](https://gtmintel.com)
 
 A Rust-based API service for company research and website analysis.
 
