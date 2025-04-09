@@ -1,6 +1,6 @@
 use axum::{
     extract::Query,
-    routing::get,
+    routing::{get, post},
     Router,
     Json,
     response::IntoResponse,
@@ -32,6 +32,10 @@ use tower_governor::{
 use std::num::NonZeroU32;
 #[cfg(not(test))]
 use std::sync::Arc;
+use spider::website::Website;
+use futures::future::join_all;
+use select::document::Document;
+use select::predicate::{Name, Attr};
 
 #[derive(Debug, Deserialize, ToSchema, IntoParams)]
 #[into_params(parameter_in = Query)]
@@ -301,9 +305,16 @@ async fn health_check() -> impl IntoResponse {
 #[openapi(
     paths(
         research_pages,
-        health_check
+        health_check,
+        crawl_domains
     ),
-    components(schemas(ResearchQuery, ResearchResponse))
+    components(schemas(
+        ResearchQuery, 
+        ResearchResponse,
+        CrawlDomainsRequest,
+        CrawlDomainsResponse,
+        PageInfo
+    ))
 )]
 struct ApiDoc;
 
@@ -316,9 +327,9 @@ pub fn create_app() -> Router {
     // ✨ ADD ALL NEW API ROUTES HERE ✨
     let api_routes = Router::new()
         .route("/research/pages/updated", get(research_pages))
-        .route("/health", get(health_check)); // Decide if /health should be rate-limited too
-        // .route("/new/api/endpoint", get(new_handler)) // Example of adding a new route
-
+        .route("/health", get(health_check))
+        .route("/research/crawl", post(crawl_domains));
+        
     // --- Conditionally apply layers and Swagger UI only when NOT running tests ---
     #[cfg(not(test))]
     let (docs_router, rate_limited_api_routes) = {
@@ -365,4 +376,132 @@ pub fn create_app() -> Router {
 
     // Return the final router
     app
+}
+
+#[derive(Debug, Deserialize, ToSchema, IntoParams)]
+pub struct CrawlDomainsRequest {
+    /// List of domains to crawl
+    domains: Vec<String>,
+    /// Maximum number of pages to crawl per domain (default: 10)
+    #[serde(default = "default_max_pages")]
+    max_pages: usize,
+}
+
+fn default_max_pages() -> usize {
+    10
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct PageInfo {
+    /// URL of the crawled page
+    url: String,
+    /// Title of the page (if available)
+    title: Option<String>,
+    /// Meta description of the page (if available)
+    description: Option<String>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct CrawlDomainsResponse {
+    /// Domain that was crawled
+    domain: String,
+    /// List of pages found with their details
+    pages: Vec<PageInfo>,
+}
+
+/// Crawl multiple domains and extract page information (URLs, titles, meta descriptions)
+#[utoipa::path(
+    post,
+    path = "/research/crawl",
+    request_body = CrawlDomainsRequest,
+    responses(
+        (status = 200, description = "Successfully crawled domains", body = Vec<CrawlDomainsResponse>),
+        (status = 422, description = "Invalid request parameters")
+    )
+)]
+async fn crawl_domains(
+    Json(request): Json<CrawlDomainsRequest>
+) -> impl IntoResponse {
+    if request.domains.is_empty() {
+        return (StatusCode::UNPROCESSABLE_ENTITY, Json(Vec::<CrawlDomainsResponse>::new()));
+    }
+
+    let crawl_futures = request.domains.iter().map(|domain| {
+        crawl_single_domain(domain, request.max_pages)
+    });
+    
+    let results = join_all(crawl_futures).await;
+    
+    (StatusCode::OK, Json(results))
+}
+
+async fn crawl_single_domain(domain: &str, max_pages: usize) -> CrawlDomainsResponse {
+    // Ensure domain has a protocol
+    let domain_with_protocol = if domain.starts_with("http") {
+        domain.to_string()
+    } else {
+        format!("https://{}", domain)
+    };
+    
+    let mut website = Website::new(&domain_with_protocol);
+    
+    // Configure the website crawler
+    website.with_respect_robots_txt(true)
+           .with_delay(100) // Be polite with 100ms delay between requests
+           .with_request_timeout(Some(std::time::Duration::from_secs(10)))
+           .with_limit(max_pages as u32); // Set the page limit
+    
+    // Scrape the website to get HTML content
+    website.scrape().await;
+    
+    let mut pages_info = Vec::new();
+    
+    if let Some(pages) = website.get_pages() {
+        for page in pages.iter() {
+            let url = page.get_url().to_string();
+            
+            // Based on the compiler error, assume page.get_html() returns String
+            let html_content = page.get_html(); // Compiler says this is String
+            
+            // Check if the String is empty instead of matching Option
+            let (title, description) = if !html_content.is_empty() {
+                // If the string is not empty, try parsing it
+                match Document::from_read(html_content.as_bytes()) {
+                    Ok(document) => {
+                        // Extract title
+                        let title = document.find(Name("title"))
+                            .next()
+                            .map(|n| n.text().trim().to_string());
+                        
+                        // Extract meta description
+                        let description = document.find(Attr("name", "description"))
+                            .next()
+                            .and_then(|n| n.attr("content"))
+                            .map(|s| s.trim().to_string());
+                        
+                        (title, description)
+                    },
+                    Err(e) => {
+                        // Log parsing error if needed
+                        tracing::warn!("Failed to parse HTML for {}: {}", url, e);
+                        (None, None) // Return None if parsing fails
+                    },
+                }
+            } else {
+                // The HTML string was empty, treat as no content
+                (None, None)
+            };
+            
+            pages_info.push(PageInfo {
+                url,
+                title,
+                description,
+            });
+        }
+    }
+    
+    CrawlDomainsResponse {
+        domain: domain.to_string(),
+        pages: pages_info,
+    }
 } 
