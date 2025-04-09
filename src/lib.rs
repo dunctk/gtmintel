@@ -303,6 +303,14 @@ async fn health_check() -> impl IntoResponse {
 
 #[derive(OpenApi)]
 #[openapi(
+    info(
+        title = "GTM INTEL API",
+        version = "0.0.1",
+        license(
+            name = "Sustainable Use License",
+            url = "https://github.com/dunctk/gtmintel/blob/main/LICENSE.md"
+        )
+    ),
     paths(
         research_pages,
         health_check,
