@@ -1,5 +1,5 @@
 use axum::{
-    extract::Query,
+    extract::{Query, State},
     routing::{get, post},
     Router,
     Json,
@@ -37,8 +37,6 @@ use futures::future::join_all;
 use select::document::Document;
 use select::predicate::{Name, Attr};
 use llm_readability::extractor;
-use html2md;
-use textdistance::str::sorensen_dice;
 use reqwest::Client;
 use url::Url;
 // --- Add backoff imports ---
@@ -48,6 +46,32 @@ use backoff::ExponentialBackoff;
 // --- End backoff imports ---
 use tracing::Instrument;
 use std::time::Instant;
+// --- Embed Anything imports ---
+use embed_anything::embeddings::embed::{Embedder, EmbedderBuilder};
+use once_cell::sync::Lazy;
+use html2text;
+use embed_anything::embeddings::embed::EmbeddingResult;
+
+// --- Global Embedder Initialization ---
+// Place this near the top, after imports
+static TEXT_EMBEDDER: Lazy<Arc<Embedder>> = Lazy::new(|| {
+    let model_architecture = "bert";
+    let model_name = "sentence-transformers/all-MiniLM-L6-v2";
+    let embedder = EmbedderBuilder::new()
+        .model_architecture(model_architecture)
+        .model_id(Some(model_name))
+        .from_pretrained_hf()
+        .expect("Failed to initialize Embedder via builder.");
+    Arc::new(embedder)
+});
+// --- End Global Embedder Initialization ---
+
+// --- Define AppState AFTER TEXT_EMBEDDER and AFTER imports, but BEFORE functions ---
+#[derive(Clone)]
+struct AppState {
+    embedder: Arc<Embedder>,
+}
+// --- End AppState Definition ---
 
 #[derive(Debug, Deserialize, ToSchema, IntoParams)]
 #[into_params(parameter_in = Query)]
@@ -351,12 +375,19 @@ pub fn create_app() -> Router {
     // Build our API documentation (needed regardless for ApiDoc::openapi())
     let api_doc = ApiDoc::openapi();
 
+    // --- Get the globally initialized embedder ---
+    let shared_embedder = TEXT_EMBEDDER.clone();
+
+    // Create the application state
+    let app_state = AppState { embedder: shared_embedder };
+
     // --- Define API routes separately ---
     let api_routes = Router::new()
         .route("/research/pages/updated", get(research_pages))
         .route("/health", get(health_check))
         .route("/research/crawl", post(crawl_domains))
-        .route("/research/similar-pages", post(compare_domain_pages));
+        .route("/research/similar-pages", post(compare_domain_pages))
+        .with_state(app_state.clone()); // Pass state to API routes
         
     // --- Conditionally apply layers and Swagger UI only when NOT running tests ---
     #[cfg(not(test))]
@@ -412,8 +443,9 @@ pub struct CompareDomainsRequest {
     domain_a: String,
     /// Second domain to compare
     domain_b: String,
-    /// Similarity threshold (0.0-1.0) for markdown content comparison (default: 0.7)
+    /// Cosine similarity threshold (0.0-1.0) for comparing page embeddings (default: 0.7)
     #[serde(default = "default_similarity_threshold")]
+    #[schema(example = 0.75)]
     similarity_threshold: f64,
 }
 
@@ -432,7 +464,10 @@ pub struct PageMetadata {
 #[derive(Debug, Clone)]
 struct ProcessedPage {
     metadata: PageMetadata,
-    markdown_content: String,
+    embedding: Option<Vec<f32>>,
+    h1: Option<String>,
+    meta_description: Option<String>,
+    intro_text: String,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -441,7 +476,8 @@ pub struct SimilarPagePair {
     page_a: PageMetadata,
     /// Page from the second domain (domain_b)
     page_b: PageMetadata,
-    /// Calculated similarity score (Sorensen-Dice)
+    /// Calculated cosine similarity score
+    #[schema(/* Add other valid schema attributes here if needed, e.g., example = 0.88 */)]
     similarity_score: f64,
 }
 
@@ -542,9 +578,32 @@ where
 }
 // --- End backoff notification handler ---
 
-// Add instrument attribute to time the whole fetch+process attempt *including retries*
-#[tracing::instrument(skip(url, client), fields(url = %url))]
-async fn fetch_and_process_page(url: String, client: Client) -> Result<ProcessedPage, Box<dyn Error + Send + Sync>> {
+// --- Helper Function for Cosine Similarity (from your suggestion) ---
+fn cosine_similarity(vec_a: &[f32], vec_b: &[f32]) -> Option<f64> {
+    if vec_a.len() != vec_b.len() || vec_a.is_empty() {
+        return None; // Vectors must have same non-zero dimension
+    }
+
+    let dot_product = vec_a.iter().zip(vec_b.iter()).map(|(a, b)| a * b).sum::<f32>();
+    let norm_a = vec_a.iter().map(|a| a.powi(2)).sum::<f32>().sqrt();
+    let norm_b = vec_b.iter().map(|b| b.powi(2)).sum::<f32>().sqrt();
+
+    if norm_a == 0.0 || norm_b == 0.0 {
+        return Some(0.0); // Avoid division by zero; zero vectors have 0 similarity
+    }
+
+    // Ensure the result is clamped between -1.0 and 1.0 due to potential float inaccuracies
+    let similarity = (dot_product / (norm_a * norm_b)) as f64;
+    Some(similarity.clamp(-1.0, 1.0))
+}
+// --- End Helper Function ---
+
+#[tracing::instrument(skip(url, client, embedder), fields(url = %url))]
+async fn fetch_and_process_page(
+    url: String,
+    client: Client,
+    embedder: Arc<Embedder>
+) -> Result<ProcessedPage, Box<dyn Error + Send + Sync>> {
     tracing::debug!("Fetching: {}", url);
 
     let backoff = ExponentialBackoff::default();
@@ -598,38 +657,132 @@ async fn fetch_and_process_page(url: String, client: Client) -> Result<Processed
     .await?;
 
     // --- Original Processing Logic (after successful fetch) ---
-    let processing_span = tracing::info_span!("blocking_processing"); // Span for the blocking part
-    let parsed_url = match Url::parse(&url) {
-        Ok(u) => u,
-        Err(e) => return Err(format!("Failed to parse URL {}: {}", url, e).into()),
-    };
-
+    let processing_span = tracing::info_span!("blocking_extraction"); // Span for blocking extraction only
     let html_content = response.text().await?;
     let original_url_string = url.clone();
 
-    // spawn_blocking itself is async, the work inside is sync
-    let processed_result = tokio::task::spawn_blocking(move || {
-        let _enter = processing_span.enter(); // Enter the span for the duration of the blocking work
-        // 1. Extract readable content
-        let product = extractor::extract(&mut html_content.as_bytes(), &parsed_url)?;
+    // Clone necessary data for the blocking task
+    let url_for_blocking = original_url_string.clone();
 
-        // 2. Extract Title
-        let title = match Document::from_read(product.content.as_bytes()) {
-             Ok(document) => document.find(Name("title")).next().map(|n| n.text().trim().to_string()),
-             Err(_) => None,
+    // --- Step 1-3 (Inside spawn_blocking): Extract text parts ---
+    let extracted_data = tokio::task::spawn_blocking(move || {
+        let _enter = processing_span.enter(); // Enter span for blocking work
+
+        // --- Extract Key Fields using select ---
+        let document = Document::from(html_content.as_str());
+        let title = document.find(Name("title")).next().map(|n| n.text().trim().to_string());
+        let h1 = document.find(Name("h1")).next().map(|n| n.text().trim().to_string());
+        let meta_description = document
+            .find(Attr("name", "description"))
+            .next()
+            .and_then(|n| n.attr("content"))
+            .map(|s| s.trim().to_string());
+
+        // --- Extract Intro Text ---
+        let parsed_url_for_extract = Url::parse(&url_for_blocking)?;
+        let intro_text = match extractor::extract(&mut html_content.as_bytes(), &parsed_url_for_extract) {
+            Ok(product) => {
+                // Basic HTML to text conversion - Handle the Result
+                let plain_text_result = html2text::from_read(product.content.as_bytes(), 120);
+                // Use unwrap_or_default to get an empty string if conversion fails
+                let plain_text = plain_text_result.unwrap_or_default();
+                // Now call split_whitespace on the String
+                plain_text.split_whitespace().take(200).collect::<Vec<&str>>().join(" ")
+            }
+            Err(e) => {
+                tracing::warn!("llm_readability failed for {}: {}", url_for_blocking, e);
+                String::new()
+            }
         };
 
-        // 3. Convert to Markdown
-        let markdown_content = html2md::rewrite_html(&product.content, false);
+        // --- Construct Representative Text ---
+        let representative_text = format!(
+            "{} {} {} {}",
+            title.as_deref().unwrap_or(""),
+            h1.as_deref().unwrap_or(""),
+            meta_description.as_deref().unwrap_or(""),
+            intro_text
+        ).trim().to_string(); // Trim potential leading/trailing whitespace
 
-        // 4. Create ProcessedPage
-        Ok::<_, Box<dyn Error + Send + Sync>>(ProcessedPage {
-            metadata: PageMetadata { url: original_url_string, title },
-            markdown_content,
-        })
-    }).await?;
+        tracing::debug!(url = %url_for_blocking, text_len = representative_text.len(), "Generated representative text");
 
-    processed_result
+        // Return extracted components
+        Ok::<_, Box<dyn Error + Send + Sync>>((
+            representative_text,
+            title,
+            h1, // Ensure h1 is returned
+            meta_description, // Ensure meta_description is returned
+            intro_text, // Ensure intro_text is returned
+        ))
+    }).await??;
+
+    let (representative_text_str, page_title, page_h1, page_meta_desc, page_intro) = extracted_data;
+
+    // --- Step 4 (Outside spawn_blocking): Generate Embedding ---
+    let embedding_option: Option<Vec<f32>> = if !representative_text_str.is_empty() {
+        let text_to_embed: [&str; 1] = [&representative_text_str];
+        let embedding_span = tracing::info_span!("async_embedding", url = %original_url_string);
+
+        match embedder.embed(&text_to_embed, None, None).instrument(embedding_span).await {
+            Ok(mut results) => {
+                if let Some(result) = results.pop() {
+                    // No need for explicit type annotation anymore
+                    // let result: embed_anything::embeddings::embed::EmbeddingResult = result;
+
+                    // Match on the CORRECT EmbeddingResult enum variants
+                    match result {
+                        // Handle the DenseVector case
+                        EmbeddingResult::DenseVector(vector) => {
+                            if !vector.is_empty() {
+                                Some(vector) // Use the dense vector directly
+                            } else {
+                                tracing::warn!("Embedding resulted in an empty DenseVector for: {}", original_url_string);
+                                None
+                            }
+                        },
+                        // Handle the MultiVector case (e.g., take the first vector or log warning)
+                        EmbeddingResult::MultiVector(mut vectors) => {
+                            if let Some(first_vector) = vectors.pop() {
+                                if !first_vector.is_empty() {
+                                    tracing::warn!("Embedding resulted in MultiVector for single input, using first vector for: {}", original_url_string);
+                                    Some(first_vector)
+                                } else {
+                                    tracing::warn!("Embedding resulted in MultiVector with empty first vector for: {}", original_url_string);
+                                    None
+                                }
+                            } else {
+                                tracing::warn!("Embedding resulted in an empty MultiVector for: {}", original_url_string);
+                                None
+                            }
+                        }
+                        // Removed the Success/Failure arms as they don't exist
+                    }
+                } else {
+                    tracing::warn!("Embedding returned empty result list for: {}", original_url_string);
+                    None
+                }
+            },
+            Err(e) => {
+                tracing::error!("Embedding generation batch failed for {}: {}", original_url_string, e);
+                None
+            }
+        }
+    } else {
+        tracing::warn!("No representative text to embed for: {}", original_url_string);
+        None
+    };
+
+    // --- Step 5: Create ProcessedPage ---
+    Ok(ProcessedPage {
+        metadata: PageMetadata {
+            url: original_url_string,
+            title: page_title,
+        },
+        embedding: embedding_option, // This should now be Option<Vec<f32>>
+        h1: page_h1,
+        meta_description: page_meta_desc,
+        intro_text: page_intro,
+    })
 }
 
 #[utoipa::path(
@@ -637,19 +790,31 @@ async fn fetch_and_process_page(url: String, client: Client) -> Result<Processed
     path = "/research/similar-pages",
     request_body = CompareDomainsRequest,
     responses(
-        (status = 200, description = "Comparison complete, returns pairs of similar pages", body = CompareDomainsResponse),
-        (status = 422, description = "Unprocessable Entity - Error finding or processing sitemaps"),
-        (status = 500, description = "Internal Server Error during processing"),
+        (status = 200, description = "Comparison complete, returns pairs of pages with similar semantic content", body = CompareDomainsResponse),
+        (status = 422, description = "Unprocessable Entity - Error finding/processing sitemaps or invalid request"),
+        (status = 500, description = "Internal Server Error during processing or embedding model failure"),
     ),
-    description = "Compares pages between two domains based on content similarity. Useful for competitive analysis (finding overlapping content) or identifying pages to skip during an SEO migration.\n\nNote: The current logic iterates through each page from domain_a and finds its single best match (if any above the threshold) on domain_b. It doesn't necessarily find every possible pair of similar pages between the two domains if, for example, one page on domain_b was the second-best match for multiple pages on domain_a."
+    description = "Compares pages between two domains based on semantic content similarity using embeddings. Provide domains and a cosine similarity threshold."
 )]
-#[tracing::instrument(skip(request), fields(domain_a = %request.domain_a, domain_b = %request.domain_b))]
+#[tracing::instrument(skip(request, state), fields(domain_a = %request.domain_a, domain_b = %request.domain_b))]
 async fn compare_domain_pages(
+    State(state): State<AppState>,
     Json(request): Json<CompareDomainsRequest>
 ) -> impl IntoResponse {
-    tracing::info!("Starting page comparison for {} vs {}", request.domain_a, request.domain_b);
+    // ---> ADD VALIDATION FOR THRESHOLD <---
+    if !(0.0..=1.0).contains(&request.similarity_threshold) {
+         return (StatusCode::UNPROCESSABLE_ENTITY, Json(serde_json::json!({
+             "error": "similarity_threshold must be between 0.0 and 1.0"
+         }))).into_response();
+    }
+    // --------------------------------------
 
-    // --- Get Sitemap URLs ---
+    tracing::info!("Starting semantic page comparison for {} vs {} with threshold {}",
+        request.domain_a, request.domain_b, request.similarity_threshold);
+
+    let embedder = state.embedder; // Get the embedder Arc from state
+
+    // --- Get Sitemap URLs (remains the same) ---
     let sitemap_url_a = match find_sitemap(&request.domain_a).await {
         Ok(Some(url)) => url,
         Ok(None) => {
@@ -686,7 +851,7 @@ async fn compare_domain_pages(
         }
     };
 
-    // --- Get All URLs from Sitemaps ---
+    // --- Get All URLs from Sitemaps (remains the same) ---
     let urls_a = match get_all_sitemap_urls(&sitemap_url_a).await {
         Ok(urls) => urls,
         Err(e) => {
@@ -714,97 +879,132 @@ async fn compare_domain_pages(
             })).into_response();
      }
 
-    // --- Fetch and Process Pages Concurrently ---
+    // --- Fetch and Process Pages Concurrently (Pass embedder) ---
     let client = Client::new();
-    let fetch_process_span_a = tracing::info_span!("fetch_process_pages", domain = %request.domain_a);
+    let fetch_process_span_a = tracing::info_span!("fetch_process_embed_pages", domain = %request.domain_a);
+    let embedder_a = embedder.clone();
     let futures_a = urls_a.into_iter().map(|url| {
         let client = client.clone();
-        // fetch_and_process_page is already instrumented
-        tokio::spawn(async move { (url.clone(), fetch_and_process_page(url, client).await) })
+        let embedder_c = embedder_a.clone();
+        // Clone url *before* the closure moves the original url
+        let url_for_span = url.clone();
+        tokio::spawn(async move {
+            // url.clone() inside here clones the *moved* url for the function call
+            (url.clone(), fetch_and_process_page(url, client, embedder_c).await)
+        })
+        // Use the clone created *outside* the async block for instrumentation
+        .instrument(tracing::info_span!("process_page_task", url = %url_for_span))
     });
-    // Time the join_all wall-clock duration
     let results_a = join_all(futures_a).instrument(fetch_process_span_a).await;
 
 
-    let fetch_process_span_b = tracing::info_span!("fetch_process_pages", domain = %request.domain_b);
-     let futures_b = urls_b.into_iter().map(|url| {
+    let fetch_process_span_b = tracing::info_span!("fetch_process_embed_pages", domain = %request.domain_b);
+    let embedder_b = embedder.clone();
+    let futures_b = urls_b.into_iter().map(|url| {
         let client = client.clone();
-        tokio::spawn(async move { (url.clone(), fetch_and_process_page(url, client).await) })
+        let embedder_c = embedder_b.clone();
+        // Clone url *before* the closure moves the original url
+        let url_for_span = url.clone();
+        tokio::spawn(async move {
+            // url.clone() inside here clones the *moved* url for the function call
+             (url.clone(), fetch_and_process_page(url, client, embedder_c).await)
+        })
+        // Use the clone created *outside* the async block for instrumentation
+        .instrument(tracing::info_span!("process_page_task", url = %url_for_span))
     });
-    // Time the join_all wall-clock duration
     let results_b = join_all(futures_b).instrument(fetch_process_span_b).await;
 
 
-    // Separate successful results from errors
+    // --- Separate successful results from errors ---
     let mut processed_a: Vec<ProcessedPage> = Vec::new();
     let mut errors_a: Vec<String> = Vec::new();
     for result in results_a {
         match result {
+             // Handle JoinError first
+             Err(join_error) => tracing::error!("JoinError processing domain_a pages: {}", join_error),
+             // Handle Result from fetch_and_process_page
             Ok((url, Ok(page))) => processed_a.push(page),
             Ok((url, Err(e))) => {
                 tracing::warn!("Failed to process URL for domain_a {}: {}", url, e);
                 errors_a.push(url);
             }
-             Err(e) => tracing::error!("JoinError processing domain_a pages: {}", e),
         }
     }
-
+    // ... similar separation logic for results_b ...
     let mut processed_b: Vec<ProcessedPage> = Vec::new();
     let mut errors_b: Vec<String> = Vec::new();
      for result in results_b {
         match result {
+             Err(join_error) => tracing::error!("JoinError processing domain_b pages: {}", join_error),
             Ok((url, Ok(page))) => processed_b.push(page),
             Ok((url, Err(e))) => {
                 tracing::warn!("Failed to process URL for domain_b {}: {}", url, e);
                 errors_b.push(url);
             }
-            Err(e) => tracing::error!("JoinError processing domain_b pages: {}", e),
-        }
+         }
     }
 
-    // --- Compare Processed Pages ---
-    // Declare similar_pairs *before* the span scope
+    tracing::info!("Processed {} pages for domain A ({} errors), {} pages for domain B ({} errors)",
+        processed_a.len(), errors_a.len(), processed_b.len(), errors_b.len());
+
+    // --- Compare Processed Pages using Embeddings ---
     let mut similar_pairs: Vec<SimilarPagePair> = Vec::new();
-    let comparison_span = tracing::info_span!("compare_markdown");
-    { // Create a scope for the span guard
-        let _enter = comparison_span.enter(); // Enter span for the synchronous comparison loop
-        // Remove the declaration from inside the scope
+    let comparison_span = tracing::info_span!("compare_embeddings"); // Renamed span
+    {
+        let _enter = comparison_span.enter(); // Time the synchronous comparison loop
+        let semantic_threshold = request.similarity_threshold; // Use the threshold from request
+
         for page_a in &processed_a {
-            // Find the best match from domain B for the current page_a
+            // Only compare if page_a has an embedding
+            if let Some(embed_a) = &page_a.embedding {
             let mut best_match_for_a: Option<&ProcessedPage> = None;
-            let mut highest_similarity_for_a = -1.0;
+                let mut highest_similarity_for_a = -2.0; // Initialize below valid cosine range (-1 to 1)
 
             for page_b in &processed_b {
-                let similarity = sorensen_dice(&page_a.markdown_content, &page_b.markdown_content);
+                    // Only compare if page_b has an embedding
+                    if let Some(embed_b) = &page_b.embedding {
+
+                        // Calculate cosine similarity using the helper
+                        if let Some(similarity) = cosine_similarity(embed_a, embed_b) {
+                             // Add debug logging for individual comparisons if needed
+                             // tracing::trace!("Comparing {} vs {}: Score {:.4}", page_a.metadata.url, page_b.metadata.url, similarity);
                 if similarity > highest_similarity_for_a {
                     highest_similarity_for_a = similarity;
                     best_match_for_a = Some(page_b);
+                            }
+                        } else {
+                             tracing::warn!("Could not calculate similarity between {} and {}", page_a.metadata.url, page_b.metadata.url);
+                        }
                 }
             }
 
-            // If the best match meets the threshold, add it to the results
-            if highest_similarity_for_a >= request.similarity_threshold {
+                // Use the semantic_threshold for cosine similarity
+                // Compare f64 values carefully
+                if highest_similarity_for_a >= semantic_threshold {
                 if let Some(matched_b) = best_match_for_a {
-                     similar_pairs.push(SimilarPagePair { // Now modifies the outer variable
+                        similar_pairs.push(SimilarPagePair {
                         page_a: page_a.metadata.clone(),
-                        page_b: matched_b.metadata.clone(), // Use the best match found
-                        similarity_score: highest_similarity_for_a,
+                            page_b: matched_b.metadata.clone(),
+                            similarity_score: highest_similarity_for_a, // Store the cosine similarity
                     });
                 }
-                // No need for an else here, we just don't add if no match is above threshold
             }
+            } else {
+                 tracing::debug!("Skipping comparison for page_a without embedding: {}", page_a.metadata.url);
         }
-        // Span guard _enter is dropped here, logging the duration
+        }
     } // End of comparison scope
+
+    tracing::info!("Found {} similar page pairs above threshold {}", similar_pairs.len(), request.similarity_threshold);
 
 
     // --- Return Response ---
     (StatusCode::OK, Json(CompareDomainsResponse {
-        domain_a: request.domain_a, // Use renamed field
-        domain_b: request.domain_b, // Use renamed field
-        similar_pages: similar_pairs, // Use the outer variable - now in scope
-        domain_a_processing_errors: errors_a, // Use new field name
-        domain_b_processing_errors: errors_b, // Use new field name
+        domain_a: request.domain_a,
+        domain_b: request.domain_b,
+        similar_pages: similar_pairs,
+        domain_a_processing_errors: errors_a,
+        domain_b_processing_errors: errors_b,
     })).into_response()
 }
 
