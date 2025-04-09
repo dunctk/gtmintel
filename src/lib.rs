@@ -319,9 +319,9 @@ pub fn create_app() -> Router {
         .route("/health", get(health_check)); // Decide if /health should be rate-limited too
         // .route("/new/api/endpoint", get(new_handler)) // Example of adding a new route
 
-    // --- Build the final application router ---
+    // --- Conditionally apply layers and Swagger UI only when NOT running tests ---
     #[cfg(not(test))]
-    {
+    let (docs_router, rate_limited_api_routes) = {
         // Create Swagger UI router
         let docs_router = SwaggerUi::new("/docs").url("/api-doc/openapi.json", api_doc);
 
@@ -334,29 +334,35 @@ pub fn create_app() -> Router {
                 .finish()
                 .unwrap(),
         );
-        
-        // Apply Governor layer ONLY to the api_routes
+        // Apply Governor layer ONLY to the api_routes defined above
         let rate_limited_api_routes = api_routes.layer(GovernorLayer { config: governor_conf });
-        
-        // Start with the rate-limited API routes and merge the docs router
-        let mut app = Router::new()
-            .merge(rate_limited_api_routes) // Add rate-limited API routes
-            .merge(docs_router);            // Add documentation routes (not rate-limited)
-            
-        // Apply CORS
+
+        (docs_router, rate_limited_api_routes)
+    };
+
+    // For test builds, use the original api_routes and an empty router for docs
+    #[cfg(test)]
+    let (docs_router, rate_limited_api_routes) = (Router::new(), api_routes);
+
+
+    // --- Build the final application router ---
+    // Start with the rate-limited API routes and merge the docs router
+    let mut app = Router::new()
+        .merge(rate_limited_api_routes) // Add rate-limited API routes
+        .merge(docs_router);            // Add documentation routes (not rate-limited)
+
+
+    // --- Apply CORS to the whole app (both API and docs) if needed ---
+    #[cfg(not(test))]
+    {
         app = app.layer(
             CorsLayer::new()
                 .allow_origin(Any)
                 .allow_methods(Any)
                 .allow_headers(Any),
         );
-        
-        app // Return the app with middleware
     }
-    
-    // For test environments, return the routes directly without rate limiting
-    #[cfg(test)]
-    {
-        api_routes // Return API routes without any rate limiting middleware
-    }
+
+    // Return the final router
+    app
 } 
