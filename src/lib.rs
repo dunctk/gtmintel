@@ -310,7 +310,7 @@ struct ApiDoc;
 /// Create the application with all routes and middleware
 pub fn create_app() -> Router {
     // Build our API documentation (needed regardless for ApiDoc::openapi())
-    let api_doc = ApiDoc::openapi();
+    let _api_doc = ApiDoc::openapi();
 
     // --- Define API routes separately ---
     // ✨ ADD ALL NEW API ROUTES HERE ✨
@@ -323,7 +323,7 @@ pub fn create_app() -> Router {
     #[cfg(not(test))]
     let (docs_router, rate_limited_api_routes) = {
         // Create Swagger UI router
-        let docs_router = SwaggerUi::new("/docs").url("/api-doc/openapi.json", api_doc);
+        let docs_router = SwaggerUi::new("/docs").url("/api-doc/openapi.json", _api_doc);
 
         // Configure Rate Limiting
         let governor_conf = Arc::new(
