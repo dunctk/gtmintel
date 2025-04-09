@@ -1,4 +1,6 @@
 # GTM INTEL API
+[![Codecov](https://codecov.io/gh/dunctk/gtmintel//branch/main/graph/badge.svg)](https://codecov.io/gh/dunctk/gtmintel)
+
 
 [**API Docs**](https://api.gtmintel.com/docs/) | [**OpenAPI Specification (JSON)**](https://api.gtmintel.com/api-doc/openapi.json)
 
