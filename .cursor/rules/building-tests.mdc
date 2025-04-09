@@ -1,0 +1,91 @@
+---
+description: When you are writing tests
+globs: 
+alwaysApply: false
+---
+
+# Guidelines for Writing Axum Tests
+
+## Testing Endpoints with Middleware
+
+When testing Axum endpoints that may have middleware like rate limiting, CORS, or authentication:
+
+### Direct Router Approach
+
+Create a simplified router directly in your test to avoid middleware complications:
+
+```rust
+// Create a direct application router WITHOUT any middleware
+let app = axum::Router::new()
+    .route("/endpoint-to-test", axum::routing::get(your_handler));
+```
+
+### Test-Specific App Creator
+
+For more complex applications, add a test-specific app creator function that omits middleware:
+
+```rust
+// In your lib.rs:
+#[cfg(test)]
+pub fn create_test_app() -> Router {
+    Router::new()
+        .route("/endpoint1", get(handler1))
+        .route("/endpoint2", get(handler2))
+        // Add routes without middleware
+}
+
+// In your test file:
+let app = your_crate::create_test_app();
+```
+
+### Testing Middleware-Dependent Code
+
+If you must test with middleware:
+
+1. Mock the middleware dependencies (like connection info for rate limiting)
+2. Use `tower::ServiceExt::layer` to selectively apply only the middleware you want to test
+3. Consider creating test-specific middleware with simplified behavior
+
+## Making HTTP Requests in Tests
+
+Use Tower's `oneshot` method for simple request testing:
+
+```rust
+let request = Request::builder()
+    .uri("/your-endpoint")
+    .method("GET")
+    .body(Body::empty())
+    .unwrap();
+
+let response = app
+    .oneshot(request)
+    .await
+    .unwrap();
+
+assert_eq!(response.status(), StatusCode::OK);
+```
+
+## Debugging Tips
+
+If a test is failing with unexpected status codes:
+
+1. Print both status code and response body:
+```rust
+let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
+let body_str = String::from_utf8_lossy(&body_bytes);
+println!("Response status: {}, body: {:?}", status, body_str);
+```
+
+2. Initialize tracing for better logs:
+```rust
+let _ = tracing_subscriber::fmt::try_init();
+```
+
+## Common Gotchas
+
+1. **Rate Limiting Middleware**: May fail in tests with "Unable To Extract Key!"
+2. **Authentication Middleware**: May reject test requests without proper auth headers
+3. **Conditional Compilation**: `#[cfg(not(test))]` may not catch all middleware if applied in complex ways
+4. **State Management**: Tests may need to mock application state
+
+Remember: The goal of endpoint tests is to verify the endpoint logic, not the middleware stack. Test middleware separately if needed.

@@ -284,16 +284,17 @@ async fn count_recent_pages(initial_sitemap_url: &str, days: u32) -> Result<(i32
     Ok((pages_counted, updated_page_urls))
 }
 
-/// Health check endpoint - Simplified Return Type
+/// Health check endpoint - EXTREMELY Simplified
 #[utoipa::path(
     get,
     path = "/health",
     responses(
-        (status = 200, description = "Service is healthy")
+        (status = 200, description = "Service is healthy", body = String)
     )
 )]
-async fn health_check() -> StatusCode { // Return StatusCode directly
-    StatusCode::OK
+async fn health_check() -> impl IntoResponse {
+    // Return both status code and a string body to match OpenAPI docs
+    (StatusCode::OK, "Service is healthy")
 }
 
 #[derive(OpenApi)]
@@ -318,9 +319,9 @@ pub fn create_app() -> Router {
         .route("/health", get(health_check)); // Decide if /health should be rate-limited too
         // .route("/new/api/endpoint", get(new_handler)) // Example of adding a new route
 
-    // --- Conditionally apply layers and Swagger UI only when NOT running tests ---
+    // --- Build the final application router ---
     #[cfg(not(test))]
-    let (docs_router, rate_limited_api_routes) = {
+    {
         // Create Swagger UI router
         let docs_router = SwaggerUi::new("/docs").url("/api-doc/openapi.json", api_doc);
 
@@ -333,35 +334,29 @@ pub fn create_app() -> Router {
                 .finish()
                 .unwrap(),
         );
-        // Apply Governor layer ONLY to the api_routes defined above
+        
+        // Apply Governor layer ONLY to the api_routes
         let rate_limited_api_routes = api_routes.layer(GovernorLayer { config: governor_conf });
-
-        (docs_router, rate_limited_api_routes)
-    };
-
-    // For test builds, use the original api_routes and an empty router for docs
-    #[cfg(test)]
-    let (docs_router, rate_limited_api_routes) = (Router::new(), api_routes);
-
-
-    // --- Build the final application router ---
-    // Start with the rate-limited API routes and merge the docs router
-    let mut app = Router::new()
-        .merge(rate_limited_api_routes) // Add rate-limited API routes
-        .merge(docs_router);            // Add documentation routes (not rate-limited)
-
-
-    // --- Apply CORS to the whole app (both API and docs) if needed ---
-    #[cfg(not(test))]
-    {
+        
+        // Start with the rate-limited API routes and merge the docs router
+        let mut app = Router::new()
+            .merge(rate_limited_api_routes) // Add rate-limited API routes
+            .merge(docs_router);            // Add documentation routes (not rate-limited)
+            
+        // Apply CORS
         app = app.layer(
             CorsLayer::new()
                 .allow_origin(Any)
                 .allow_methods(Any)
                 .allow_headers(Any),
         );
+        
+        app // Return the app with middleware
     }
-
-    // Return the final router
-    app
+    
+    // For test environments, return the routes directly without rate limiting
+    #[cfg(test)]
+    {
+        api_routes // Return API routes without any rate limiting middleware
+    }
 } 
