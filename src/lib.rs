@@ -46,6 +46,8 @@ use backoff::future::retry_notify;
 use backoff::Error as BackoffError;
 use backoff::ExponentialBackoff;
 // --- End backoff imports ---
+use tracing::Instrument;
+use std::time::Instant;
 
 #[derive(Debug, Deserialize, ToSchema, IntoParams)]
 #[into_params(parameter_in = Query)]
@@ -92,6 +94,7 @@ pub struct ResearchResponse {
         (status = 422, description = "Unprocessable Entity - Sitemap not found", body = ResearchResponse)
     )
 )]
+#[tracing::instrument(skip(query), fields(domain = %query.domain))]
 async fn research_pages(Query(query): Query<ResearchQuery>) -> impl IntoResponse {
     let sitemap_result = find_sitemap(&query.domain).await;
 
@@ -139,6 +142,7 @@ async fn research_pages(Query(query): Query<ResearchQuery>) -> impl IntoResponse
 }
 
 /// Attempts to find the sitemap URL for a given domain, checking robots.txt first, then common locations.
+#[tracing::instrument(skip(domain), fields(domain = %domain))]
 async fn find_sitemap(domain: &str) -> Result<Option<String>, Box<dyn Error + Send + Sync>> {
     // Ensure domain has protocol and no trailing slash
     let base_url = if !domain.starts_with("http") {
@@ -220,6 +224,7 @@ async fn find_sitemap(domain: &str) -> Result<Option<String>, Box<dyn Error + Se
 
 /// Count pages modified within the last `days` from a sitemap URL, handling sitemap indexes.
 /// Returns a tuple: (count, list_of_updated_page_urls).
+#[tracing::instrument(skip(initial_sitemap_url), fields(initial_sitemap_url = %initial_sitemap_url, days = %days))]
 async fn count_recent_pages(initial_sitemap_url: &str, days: u32) -> Result<(i32, Vec<String>), Box<dyn Error + Send + Sync>> {
     let mut pages_counted = 0;
     let mut updated_page_urls: Vec<String> = Vec::new();
@@ -325,7 +330,7 @@ async fn health_check() -> impl IntoResponse {
         research_pages,
         health_check,
         crawl_domains,
-        analyze_migration_handler
+        compare_domain_pages
     ),
     components(schemas(
         ResearchQuery, 
@@ -333,9 +338,9 @@ async fn health_check() -> impl IntoResponse {
         CrawlDomainsRequest,
         CrawlDomainsResponse,
         PageInfo,
-        MigrationAnalysisRequest,
-        MigrationAnalysisResponse,
-        MigrationSkipRecommendation,
+        CompareDomainsRequest,
+        CompareDomainsResponse,
+        SimilarPagePair,
         PageMetadata
     ))
 )]
@@ -351,7 +356,7 @@ pub fn create_app() -> Router {
         .route("/research/pages/updated", get(research_pages))
         .route("/health", get(health_check))
         .route("/research/crawl", post(crawl_domains))
-        .route("/research/migration-analysis", post(analyze_migration_handler));
+        .route("/research/similar-pages", post(compare_domain_pages));
         
     // --- Conditionally apply layers and Swagger UI only when NOT running tests ---
     #[cfg(not(test))]
@@ -402,12 +407,12 @@ pub fn create_app() -> Router {
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
-pub struct MigrationAnalysisRequest {
-    /// Source domain (where we're migrating from)
-    source_domain: String,
-    /// Target domain (where we're migrating to)
-    target_domain: String,
-    /// Similarity threshold (0.0-1.0) to consider content as duplicate (default: 0.7)
+pub struct CompareDomainsRequest {
+    /// First domain to compare
+    domain_a: String,
+    /// Second domain to compare
+    domain_b: String,
+    /// Similarity threshold (0.0-1.0) for markdown content comparison (default: 0.7)
     #[serde(default = "default_similarity_threshold")]
     similarity_threshold: f64,
 }
@@ -431,31 +436,30 @@ struct ProcessedPage {
 }
 
 #[derive(Debug, Serialize, ToSchema)]
-pub struct MigrationSkipRecommendation {
-    /// Source page metadata
-    source_page: PageMetadata,
-    /// Target page metadata (best match)
-    target_page: PageMetadata,
-    /// Similarity score between the pages (using Sorensen-Dice)
+pub struct SimilarPagePair {
+    /// Page from the first domain (domain_a)
+    page_a: PageMetadata,
+    /// Page from the second domain (domain_b)
+    page_b: PageMetadata,
+    /// Calculated similarity score (Sorensen-Dice)
     similarity_score: f64,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
-pub struct MigrationAnalysisResponse {
-    /// Source domain analyzed
-    source_domain: String,
-    /// Target domain analyzed
-    target_domain: String,
-    /// Pages on the source domain considered unique enough to migrate
-    pages_to_migrate: Vec<PageMetadata>,
-    /// Pages on the source domain with similar content found on the target
-    pages_to_skip: Vec<MigrationSkipRecommendation>,
-    /// URLs from source sitemap that failed to process
-    source_processing_errors: Vec<String>,
-    /// URLs from target sitemap that failed to process
-    target_processing_errors: Vec<String>,
+pub struct CompareDomainsResponse {
+    /// First domain analyzed
+    domain_a: String,
+    /// Second domain analyzed
+    domain_b: String,
+    /// List of similar page pairs
+    similar_pages: Vec<SimilarPagePair>,
+    /// URLs from the first domain's sitemap that failed to process
+    domain_a_processing_errors: Vec<String>,
+    /// URLs from the second domain's sitemap that failed to process
+    domain_b_processing_errors: Vec<String>,
 }
 
+#[tracing::instrument(skip(initial_sitemap_url), fields(initial_sitemap_url = %initial_sitemap_url))]
 async fn get_all_sitemap_urls(initial_sitemap_url: &str) -> Result<Vec<String>, Box<dyn Error + Send + Sync>> {
     let mut all_page_urls: Vec<String> = Vec::new();
     let mut sitemap_queue: VecDeque<String> = VecDeque::new();
@@ -538,11 +542,14 @@ where
 }
 // --- End backoff notification handler ---
 
+// Add instrument attribute to time the whole fetch+process attempt *including retries*
+#[tracing::instrument(skip(url, client), fields(url = %url))]
 async fn fetch_and_process_page(url: String, client: Client) -> Result<ProcessedPage, Box<dyn Error + Send + Sync>> {
     tracing::debug!("Fetching: {}", url);
 
     let backoff = ExponentialBackoff::default();
 
+    // Timing the whole function includes retries and processing
     let response = retry_notify(
         backoff,
         || async {
@@ -588,10 +595,10 @@ async fn fetch_and_process_page(url: String, client: Client) -> Result<Processed
         },
         retry_notify_handler,
     )
-    .await?; // Keep '?' here to handle the final result of retry_notify
+    .await?;
 
     // --- Original Processing Logic (after successful fetch) ---
-    // No need to check response.status().is_success() again, as the retry logic ensures it if Ok
+    let processing_span = tracing::info_span!("blocking_processing"); // Span for the blocking part
     let parsed_url = match Url::parse(&url) {
         Ok(u) => u,
         Err(e) => return Err(format!("Failed to parse URL {}: {}", url, e).into()),
@@ -600,7 +607,9 @@ async fn fetch_and_process_page(url: String, client: Client) -> Result<Processed
     let html_content = response.text().await?;
     let original_url_string = url.clone();
 
+    // spawn_blocking itself is async, the work inside is sync
     let processed_result = tokio::task::spawn_blocking(move || {
+        let _enter = processing_span.enter(); // Enter the span for the duration of the blocking work
         // 1. Extract readable content
         let product = extractor::extract(&mut html_content.as_bytes(), &parsed_url)?;
 
@@ -625,156 +634,177 @@ async fn fetch_and_process_page(url: String, client: Client) -> Result<Processed
 
 #[utoipa::path(
     post,
-    path = "/research/migration-analysis",
-    request_body = MigrationAnalysisRequest,
+    path = "/research/similar-pages",
+    request_body = CompareDomainsRequest,
     responses(
-        (status = 200, description = "Migration analysis complete", body = MigrationAnalysisResponse),
+        (status = 200, description = "Comparison complete, returns pairs of similar pages", body = CompareDomainsResponse),
         (status = 422, description = "Unprocessable Entity - Error finding or processing sitemaps"),
-        (status = 500, description = "Internal Server Error during processing")
-    )
+        (status = 500, description = "Internal Server Error during processing"),
+    ),
+    description = "Compares pages between two domains based on content similarity. Useful for competitive analysis (finding overlapping content) or identifying pages to skip during an SEO migration."
 )]
-async fn analyze_migration_handler(
-    Json(request): Json<MigrationAnalysisRequest>
+#[tracing::instrument(skip(request), fields(domain_a = %request.domain_a, domain_b = %request.domain_b))]
+async fn compare_domain_pages(
+    Json(request): Json<CompareDomainsRequest>
 ) -> impl IntoResponse {
-    tracing::info!("Starting migration analysis for {} vs {}", request.source_domain, request.target_domain);
+    tracing::info!("Starting page comparison for {} vs {}", request.domain_a, request.domain_b);
 
-    // --- Get Source Sitemap URL ---
-    let source_sitemap_url = match find_sitemap(&request.source_domain).await {
-        Ok(Some(url)) => url, // Correctly unwraps Ok(Some(url))
+    // --- Get Sitemap URLs ---
+    let sitemap_url_a = match find_sitemap(&request.domain_a).await {
+        Ok(Some(url)) => url,
         Ok(None) => {
-            tracing::error!("Sitemap not found for source domain: {}", request.source_domain);
-            return (StatusCode::UNPROCESSABLE_ENTITY, Json(MigrationAnalysisResponse {
-                source_domain: request.source_domain, target_domain: request.target_domain,
-                pages_to_migrate: vec![], pages_to_skip: vec![],
-                source_processing_errors: vec![], target_processing_errors: vec![],
+            tracing::error!("Sitemap not found for domain_a: {}", request.domain_a);
+            // Return CompareDomainsResponse structure on error
+            return (StatusCode::UNPROCESSABLE_ENTITY, Json(CompareDomainsResponse {
+                domain_a: request.domain_a, domain_b: request.domain_b,
+                similar_pages: vec![],
+                domain_a_processing_errors: vec!["Sitemap not found".to_string()], // Indicate error source
+                domain_b_processing_errors: vec![],
             })).into_response();
         },
         Err(e) => {
-            tracing::error!("Error finding source sitemap for {}: {}", request.source_domain, e);
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(format!("Error finding source sitemap: {}", e))).into_response();
+            tracing::error!("Error finding sitemap for domain_a {}: {}", request.domain_a, e);
+            // Return simple JSON string for internal server errors to avoid complex struct creation on critical failure
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": format!("Error finding sitemap for domain_a: {}", e)}))).into_response();
         }
     };
-
-    // --- Get Target Sitemap URL ---
-    let target_sitemap_url = match find_sitemap(&request.target_domain).await {
-         Ok(Some(url)) => url, // Correctly unwraps Ok(Some(url))
+    let sitemap_url_b = match find_sitemap(&request.domain_b).await {
+         Ok(Some(url)) => url,
         Ok(None) => {
-            tracing::error!("Sitemap not found for target domain: {}", request.target_domain);
-             return (StatusCode::UNPROCESSABLE_ENTITY, Json(MigrationAnalysisResponse {
-                source_domain: request.source_domain, target_domain: request.target_domain,
-                pages_to_migrate: vec![], pages_to_skip: vec![],
-                source_processing_errors: vec![], target_processing_errors: vec![],
+            tracing::error!("Sitemap not found for domain_b: {}", request.domain_b);
+             return (StatusCode::UNPROCESSABLE_ENTITY, Json(CompareDomainsResponse {
+                domain_a: request.domain_a, domain_b: request.domain_b,
+                similar_pages: vec![],
+                domain_a_processing_errors: vec![],
+                domain_b_processing_errors: vec!["Sitemap not found".to_string()], // Indicate error source
             })).into_response();
         },
         Err(e) => {
-            tracing::error!("Error finding target sitemap for {}: {}", request.target_domain, e);
-             return (StatusCode::INTERNAL_SERVER_ERROR, Json(format!("Error finding target sitemap: {}", e))).into_response();
+            tracing::error!("Error finding sitemap for domain_b {}: {}", request.domain_b, e);
+             // Return simple JSON string for internal server errors
+             return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": format!("Error finding sitemap for domain_b: {}", e)}))).into_response();
         }
     };
 
-    // --- Get URLs from Sitemaps (Now passing &str) ---
-    let source_urls = match get_all_sitemap_urls(&source_sitemap_url).await { // Now source_sitemap_url is String
+    // --- Get All URLs from Sitemaps ---
+    let urls_a = match get_all_sitemap_urls(&sitemap_url_a).await {
         Ok(urls) => urls,
         Err(e) => {
-            tracing::error!("Error getting source URLs from {}: {}", source_sitemap_url, e);
-            return (StatusCode::UNPROCESSABLE_ENTITY, Json(format!("Error processing source sitemap: {}", e))).into_response();
+            tracing::error!("Error getting URLs for domain_a {}: {}", request.domain_a, e);
+            // Return simple JSON string for unprocessable entity errors related to sitemap processing
+            return (StatusCode::UNPROCESSABLE_ENTITY, Json(serde_json::json!({ "error": format!("Error processing sitemap for domain_a: {}", e)}))).into_response();
         }
     };
-     let target_urls = match get_all_sitemap_urls(&target_sitemap_url).await { // Now target_sitemap_url is String
+     let urls_b = match get_all_sitemap_urls(&sitemap_url_b).await {
         Ok(urls) => urls,
          Err(e) => {
-            tracing::error!("Error getting target URLs from {}: {}", target_sitemap_url, e);
-            return (StatusCode::UNPROCESSABLE_ENTITY, Json(format!("Error processing target sitemap: {}", e))).into_response();
+            tracing::error!("Error getting URLs for domain_b {}: {}", request.domain_b, e);
+            // Return simple JSON string for unprocessable entity errors related to sitemap processing
+            return (StatusCode::UNPROCESSABLE_ENTITY, Json(serde_json::json!({ "error": format!("Error processing sitemap for domain_b: {}", e)}))).into_response();
         }
     };
 
-     if source_urls.is_empty() || target_urls.is_empty() {
-         tracing::warn!("One or both sitemaps resulted in zero URLs. Source: {}, Target: {}", source_urls.len(), target_urls.len());
-         return (StatusCode::OK, Json(MigrationAnalysisResponse {
-                source_domain: request.source_domain, target_domain: request.target_domain,
-                pages_to_migrate: vec![], pages_to_skip: vec![],
-                source_processing_errors: vec![], target_processing_errors: vec![],
+     if urls_a.is_empty() || urls_b.is_empty() {
+         tracing::warn!("One or both domains have zero URLs in sitemap. A: {}, B: {}", urls_a.len(), urls_b.len());
+         return (StatusCode::OK, Json(CompareDomainsResponse {
+                domain_a: request.domain_a, domain_b: request.domain_b,
+                similar_pages: vec![],
+                domain_a_processing_errors: vec![],
+                domain_b_processing_errors: vec![],
             })).into_response();
      }
 
+    // --- Fetch and Process Pages Concurrently ---
     let client = Client::new();
-    let source_futures = source_urls.into_iter().map(|url| {
+    let fetch_process_span_a = tracing::info_span!("fetch_process_pages", domain = %request.domain_a);
+    let futures_a = urls_a.into_iter().map(|url| {
+        let client = client.clone();
+        // fetch_and_process_page is already instrumented
+        tokio::spawn(async move { (url.clone(), fetch_and_process_page(url, client).await) })
+    });
+    // Time the join_all wall-clock duration
+    let results_a = join_all(futures_a).instrument(fetch_process_span_a).await;
+
+
+    let fetch_process_span_b = tracing::info_span!("fetch_process_pages", domain = %request.domain_b);
+     let futures_b = urls_b.into_iter().map(|url| {
         let client = client.clone();
         tokio::spawn(async move { (url.clone(), fetch_and_process_page(url, client).await) })
     });
-     let target_futures = target_urls.into_iter().map(|url| {
-        let client = client.clone();
-        tokio::spawn(async move { (url.clone(), fetch_and_process_page(url, client).await) })
-    });
+    // Time the join_all wall-clock duration
+    let results_b = join_all(futures_b).instrument(fetch_process_span_b).await;
 
-    let source_results = join_all(source_futures).await;
-    let target_results = join_all(target_futures).await;
 
-    let mut source_processed: Vec<ProcessedPage> = Vec::new();
-    let mut source_errors: Vec<String> = Vec::new();
-    for result in source_results {
+    // Separate successful results from errors
+    let mut processed_a: Vec<ProcessedPage> = Vec::new();
+    let mut errors_a: Vec<String> = Vec::new();
+    for result in results_a {
         match result {
-            Ok((url, Ok(page))) => source_processed.push(page),
+            Ok((url, Ok(page))) => processed_a.push(page),
             Ok((url, Err(e))) => {
-                tracing::warn!("Failed to process source URL {}: {}", url, e);
-                source_errors.push(url);
+                tracing::warn!("Failed to process URL for domain_a {}: {}", url, e);
+                errors_a.push(url);
             }
-             Err(e) => tracing::error!("JoinError processing source pages: {}", e),
+             Err(e) => tracing::error!("JoinError processing domain_a pages: {}", e),
         }
     }
 
-    let mut target_processed: Vec<ProcessedPage> = Vec::new();
-    let mut target_errors: Vec<String> = Vec::new();
-     for result in target_results {
+    let mut processed_b: Vec<ProcessedPage> = Vec::new();
+    let mut errors_b: Vec<String> = Vec::new();
+     for result in results_b {
         match result {
-            Ok((url, Ok(page))) => target_processed.push(page),
+            Ok((url, Ok(page))) => processed_b.push(page),
             Ok((url, Err(e))) => {
-                tracing::warn!("Failed to process target URL {}: {}", url, e);
-                target_errors.push(url);
+                tracing::warn!("Failed to process URL for domain_b {}: {}", url, e);
+                errors_b.push(url);
             }
-            Err(e) => tracing::error!("JoinError processing target pages: {}", e),
+            Err(e) => tracing::error!("JoinError processing domain_b pages: {}", e),
         }
     }
 
-    let mut pages_to_migrate: Vec<PageMetadata> = Vec::new();
-    let mut pages_to_skip: Vec<MigrationSkipRecommendation> = Vec::new();
+    // --- Compare Processed Pages ---
+    // Declare similar_pairs *before* the span scope
+    let mut similar_pairs: Vec<SimilarPagePair> = Vec::new();
+    let comparison_span = tracing::info_span!("compare_markdown");
+    { // Create a scope for the span guard
+        let _enter = comparison_span.enter(); // Enter span for the synchronous comparison loop
+        // Remove the declaration from inside the scope
+        for page_a in &processed_a {
+            // Find the best match from domain B for the current page_a
+            let mut best_match_for_a: Option<&ProcessedPage> = None;
+            let mut highest_similarity_for_a = -1.0;
 
-    for source_page in &source_processed {
-        let mut best_match_target_page: Option<&ProcessedPage> = None;
-        let mut highest_similarity = -1.0;
+            for page_b in &processed_b {
+                let similarity = sorensen_dice(&page_a.markdown_content, &page_b.markdown_content);
+                if similarity > highest_similarity_for_a {
+                    highest_similarity_for_a = similarity;
+                    best_match_for_a = Some(page_b);
+                }
+            }
 
-        for target_page in &target_processed {
-            let similarity = sorensen_dice(&source_page.markdown_content, &target_page.markdown_content);
-
-            if similarity > highest_similarity {
-                highest_similarity = similarity;
-                best_match_target_page = Some(target_page);
+            // If the best match meets the threshold, add it to the results
+            if highest_similarity_for_a >= request.similarity_threshold {
+                if let Some(matched_b) = best_match_for_a {
+                     similar_pairs.push(SimilarPagePair { // Now modifies the outer variable
+                        page_a: page_a.metadata.clone(),
+                        page_b: matched_b.metadata.clone(), // Use the best match found
+                        similarity_score: highest_similarity_for_a,
+                    });
+                }
+                // No need for an else here, we just don't add if no match is above threshold
             }
         }
+        // Span guard _enter is dropped here, logging the duration
+    } // End of comparison scope
 
-        if highest_similarity >= request.similarity_threshold {
-            if let Some(matched_target) = best_match_target_page {
-                 pages_to_skip.push(MigrationSkipRecommendation {
-                    source_page: source_page.metadata.clone(),
-                    target_page: matched_target.metadata.clone(),
-                    similarity_score: highest_similarity,
-                });
-            } else {
-                 tracing::error!("Similarity threshold met but no best match found for {}", source_page.metadata.url);
-                 pages_to_migrate.push(source_page.metadata.clone());
-            }
-        } else {
-             pages_to_migrate.push(source_page.metadata.clone());
-        }
-    }
 
-    (StatusCode::OK, Json(MigrationAnalysisResponse {
-        source_domain: request.source_domain,
-        target_domain: request.target_domain,
-        pages_to_migrate,
-        pages_to_skip,
-        source_processing_errors: source_errors,
-        target_processing_errors: target_errors,
+    // --- Return Response ---
+    (StatusCode::OK, Json(CompareDomainsResponse {
+        domain_a: request.domain_a, // Use renamed field
+        domain_b: request.domain_b, // Use renamed field
+        similar_pages: similar_pairs, // Use the outer variable - now in scope
+        domain_a_processing_errors: errors_a, // Use new field name
+        domain_b_processing_errors: errors_b, // Use new field name
     })).into_response()
 }
 
@@ -819,6 +849,7 @@ pub struct CrawlDomainsResponse {
         (status = 422, description = "Invalid request parameters")
     )
 )]
+#[tracing::instrument(skip(request))]
 async fn crawl_domains(
     Json(request): Json<CrawlDomainsRequest>
 ) -> impl IntoResponse {
@@ -830,11 +861,13 @@ async fn crawl_domains(
         crawl_single_domain(domain, request.max_pages)
     });
     
-    let results = join_all(crawl_futures).await;
+    let crawl_span = tracing::info_span!("crawl_all_requested_domains");
+    let results = join_all(crawl_futures).instrument(crawl_span).await;
     
     (StatusCode::OK, Json(results)).into_response()
 }
 
+#[tracing::instrument(skip(domain), fields(domain = %domain, max_pages = %max_pages))]
 async fn crawl_single_domain(domain: &str, max_pages: usize) -> CrawlDomainsResponse {
     let domain_with_protocol = if domain.starts_with("http") {
         domain.to_string()
@@ -849,49 +882,55 @@ async fn crawl_single_domain(domain: &str, max_pages: usize) -> CrawlDomainsResp
            .with_request_timeout(Some(std::time::Duration::from_secs(10)))
            .with_limit(max_pages as u32);
     
-    website.scrape().await;
+    let scrape_span = tracing::info_span!("spider_scrape");
+    website.scrape().instrument(scrape_span).await;
     
+    // Declare pages_info *before* the span scope
     let mut pages_info = Vec::new();
-    
-    if let Some(pages) = website.get_pages() {
-        for page in pages.iter() {
-            let url = page.get_url().to_string();
-            
-            let html_content = page.get_html();
-            
-            let (title, description) = if !html_content.is_empty() {
-                match Document::from_read(html_content.as_bytes()) {
-                    Ok(document) => {
-                        let title = document.find(Name("title"))
-                            .next()
-                            .map(|n| n.text().trim().to_string());
-                        
-                        let description = document.find(Attr("name", "description"))
-                            .next()
-                            .and_then(|n| n.attr("content"))
-                            .map(|s| s.trim().to_string());
-                        
-                        (title, description)
-                    },
-                    Err(e) => {
-                        tracing::warn!("Failed to parse HTML for {}: {}", url, e);
-                        (None, None)
-                    },
-                }
-            } else {
-                (None, None)
-            };
-            
-            pages_info.push(PageInfo {
-                url,
-                title,
-                description,
-            });
+    let process_results_span = tracing::info_span!("process_scraped_pages");
+    {
+        let _enter = process_results_span.enter(); // Time the sync processing loop
+        // Remove the declaration from inside the scope
+        if let Some(pages) = website.get_pages() {
+            for page in pages.iter() {
+                let url = page.get_url().to_string();
+                
+                let html_content = page.get_html();
+                
+                let (title, description) = if !html_content.is_empty() {
+                    match Document::from_read(html_content.as_bytes()) {
+                        Ok(document) => {
+                            let title = document.find(Name("title"))
+                                .next()
+                                .map(|n| n.text().trim().to_string());
+                            
+                            let description = document.find(Attr("name", "description"))
+                                .next()
+                                .and_then(|n| n.attr("content"))
+                                .map(|s| s.trim().to_string());
+                            
+                            (title, description)
+                        },
+                        Err(e) => {
+                            tracing::warn!("Failed to parse HTML for {}: {}", url, e);
+                            (None, None)
+                        },
+                    }
+                } else {
+                    (None, None)
+                };
+                
+                pages_info.push(PageInfo {
+                    url,
+                    title,
+                    description,
+                });
+            }
         }
-    }
+    } // End processing scope
     
     CrawlDomainsResponse {
         domain: domain.to_string(),
-        pages: pages_info,
+        pages: pages_info, // Use the outer variable - now in scope
     }
 } 

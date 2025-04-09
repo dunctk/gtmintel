@@ -1,11 +1,14 @@
 use gtmintel::create_app;
 use std::net::SocketAddr;
 use tracing_subscriber;
+use tracing::Level;
 
 #[tokio::main]
 async fn main() {
-    // Initialize tracing
-    tracing_subscriber::fmt::init();
+    // Initialize tracing subscriber with level configuration
+    tracing_subscriber::fmt()
+        .with_max_level(Level::DEBUG)
+        .init();
 
     // Run our server
     let app = create_app();
