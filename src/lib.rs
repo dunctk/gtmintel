@@ -36,6 +36,16 @@ use spider::website::Website;
 use futures::future::join_all;
 use select::document::Document;
 use select::predicate::{Name, Attr};
+use llm_readability::extractor;
+use html2md;
+use textdistance::str::sorensen_dice;
+use reqwest::Client;
+use url::Url;
+// --- Add backoff imports ---
+use backoff::future::retry_notify;
+use backoff::Error as BackoffError;
+use backoff::ExponentialBackoff;
+// --- End backoff imports ---
 
 #[derive(Debug, Deserialize, ToSchema, IntoParams)]
 #[into_params(parameter_in = Query)]
@@ -314,14 +324,19 @@ async fn health_check() -> impl IntoResponse {
     paths(
         research_pages,
         health_check,
-        crawl_domains
+        crawl_domains,
+        analyze_migration_handler
     ),
     components(schemas(
         ResearchQuery, 
         ResearchResponse,
         CrawlDomainsRequest,
         CrawlDomainsResponse,
-        PageInfo
+        PageInfo,
+        MigrationAnalysisRequest,
+        MigrationAnalysisResponse,
+        MigrationSkipRecommendation,
+        PageMetadata
     ))
 )]
 struct ApiDoc;
@@ -329,27 +344,27 @@ struct ApiDoc;
 /// Create the application with all routes and middleware
 pub fn create_app() -> Router {
     // Build our API documentation (needed regardless for ApiDoc::openapi())
-    let _api_doc = ApiDoc::openapi();
+    let api_doc = ApiDoc::openapi();
 
     // --- Define API routes separately ---
-    // ✨ ADD ALL NEW API ROUTES HERE ✨
     let api_routes = Router::new()
         .route("/research/pages/updated", get(research_pages))
         .route("/health", get(health_check))
-        .route("/research/crawl", post(crawl_domains));
+        .route("/research/crawl", post(crawl_domains))
+        .route("/research/migration-analysis", post(analyze_migration_handler));
         
     // --- Conditionally apply layers and Swagger UI only when NOT running tests ---
     #[cfg(not(test))]
     let (docs_router, rate_limited_api_routes) = {
         // Create Swagger UI router
-        let docs_router = SwaggerUi::new("/docs").url("/api-doc/openapi.json", _api_doc);
+        let docs_router = SwaggerUi::new("/docs").url("/api-doc/openapi.json", api_doc);
 
         // Configure Rate Limiting
         let governor_conf = Arc::new(
             GovernorConfigBuilder::default()
                 .key_extractor(SmartIpKeyExtractor)
-                .period(std::time::Duration::from_secs(12))
-                .burst_size(NonZeroU32::new(5).unwrap().into())
+                .period(std::time::Duration::from_secs(60))
+                .burst_size(NonZeroU32::new(10).unwrap().into())
                 .finish()
                 .unwrap(),
         );
@@ -386,7 +401,384 @@ pub fn create_app() -> Router {
     app
 }
 
-#[derive(Debug, Deserialize, ToSchema, IntoParams)]
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct MigrationAnalysisRequest {
+    /// Source domain (where we're migrating from)
+    source_domain: String,
+    /// Target domain (where we're migrating to)
+    target_domain: String,
+    /// Similarity threshold (0.0-1.0) to consider content as duplicate (default: 0.7)
+    #[serde(default = "default_similarity_threshold")]
+    similarity_threshold: f64,
+}
+
+fn default_similarity_threshold() -> f64 {
+    0.7
+}
+
+#[derive(Debug, Serialize, ToSchema, Clone)]
+pub struct PageMetadata {
+    /// URL of the page
+    url: String,
+    /// Title extracted by llm_readability (if available)
+    title: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ProcessedPage {
+    metadata: PageMetadata,
+    markdown_content: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct MigrationSkipRecommendation {
+    /// Source page metadata
+    source_page: PageMetadata,
+    /// Target page metadata (best match)
+    target_page: PageMetadata,
+    /// Similarity score between the pages (using Sorensen-Dice)
+    similarity_score: f64,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct MigrationAnalysisResponse {
+    /// Source domain analyzed
+    source_domain: String,
+    /// Target domain analyzed
+    target_domain: String,
+    /// Pages on the source domain considered unique enough to migrate
+    pages_to_migrate: Vec<PageMetadata>,
+    /// Pages on the source domain with similar content found on the target
+    pages_to_skip: Vec<MigrationSkipRecommendation>,
+    /// URLs from source sitemap that failed to process
+    source_processing_errors: Vec<String>,
+    /// URLs from target sitemap that failed to process
+    target_processing_errors: Vec<String>,
+}
+
+async fn get_all_sitemap_urls(initial_sitemap_url: &str) -> Result<Vec<String>, Box<dyn Error + Send + Sync>> {
+    let mut all_page_urls: Vec<String> = Vec::new();
+    let mut sitemap_queue: VecDeque<String> = VecDeque::new();
+    sitemap_queue.push_back(initial_sitemap_url.to_string());
+    let mut processed_sitemaps: HashSet<String> = HashSet::new();
+    let client = Client::new();
+
+    while let Some(sitemap_url) = sitemap_queue.pop_front() {
+        if !processed_sitemaps.insert(sitemap_url.clone()) {
+            tracing::debug!("Skipping already processed sitemap: {}", sitemap_url);
+            continue;
+        }
+        tracing::info!("Processing sitemap: {}", sitemap_url);
+
+        let sitemap_response = match client.get(&sitemap_url).send().await {
+            Ok(res) => res,
+            Err(e) => {
+                tracing::error!("Failed to fetch sitemap {}: {}", sitemap_url, e);
+                return Err(format!("Failed to fetch sitemap {}: {}", sitemap_url, e).into());
+            }
+        };
+
+        if !sitemap_response.status().is_success() {
+            tracing::warn!("Failed to fetch sitemap {} - Status: {}", sitemap_url, sitemap_response.status());
+            return Err(format!("Failed to fetch sitemap {} - Status: {}", sitemap_url, sitemap_response.status()).into());
+        }
+
+        let sitemap_content = match sitemap_response.bytes().await {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                tracing::error!("Failed to read bytes from sitemap {}: {}", sitemap_url, e);
+                return Err(format!("Failed to read bytes from sitemap {}: {}", sitemap_url, e).into());
+            }
+        };
+
+        let cursor = Cursor::new(sitemap_content);
+        let parser = SiteMapReader::new(cursor);
+
+        for entity in parser {
+            match entity {
+                SiteMapEntity::Url(url_entry) => {
+                    if let Some(loc_url) = url_entry.loc.get_url() {
+                        all_page_urls.push(loc_url.to_string());
+                    } else {
+                         tracing::warn!("URL entry location could not be resolved: {:?}", url_entry.loc);
+                    }
+                },
+                SiteMapEntity::SiteMap(sitemap_entry) => {
+                    if let Some(nested_sitemap_url) = sitemap_entry.loc.get_url() {
+                        let nested_url_str = nested_sitemap_url.to_string();
+                        if !processed_sitemaps.contains(&nested_url_str) {
+                             tracing::debug!("Found nested sitemap, adding to queue: {}", nested_url_str);
+                            sitemap_queue.push_back(nested_url_str);
+                        }
+                    } else {
+                        tracing::warn!("Sitemap entry location could not be resolved to a URL: {:?}", sitemap_entry.loc);
+                    }
+                },
+                SiteMapEntity::Err(error) => {
+                    tracing::warn!("Error parsing entity in {}: {}", sitemap_url, error);
+                }
+            }
+        }
+    }
+
+    tracing::info!("Found {} total page URLs in sitemap(s) starting from {}", all_page_urls.len(), initial_sitemap_url);
+    Ok(all_page_urls)
+}
+
+// --- Backoff notification handler ---
+fn retry_notify_handler<E>(err: E, duration: std::time::Duration)
+where
+    E: std::fmt::Display,
+{
+    tracing::warn!(
+        "Request failed: {}. Retrying in {:.1}s...",
+        err,
+        duration.as_secs_f32()
+    );
+}
+// --- End backoff notification handler ---
+
+async fn fetch_and_process_page(url: String, client: Client) -> Result<ProcessedPage, Box<dyn Error + Send + Sync>> {
+    tracing::debug!("Fetching: {}", url);
+
+    let backoff = ExponentialBackoff::default();
+
+    let response = retry_notify(
+        backoff,
+        || async {
+            // Remove '?' and handle the result explicitly
+            match client.get(&url).send().await {
+                Ok(resp) => {
+                    // --- Request was successful, now check status code ---
+                    let status = resp.status();
+                    if status.is_success() {
+                        Ok(resp) // Success!
+                    } else if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
+                        // Server returned a status indicating a transient issue
+                        tracing::debug!("Retrying on status: {}", status);
+                        Err(BackoffError::transient(anyhow::anyhow!(
+                            "Server returned retryable status: {}",
+                            status
+                        )))
+                    } else {
+                        // Server returned a status indicating a permanent issue
+                        tracing::debug!("Permanent error status: {}", status);
+                        Err(BackoffError::permanent(anyhow::anyhow!(
+                            "Server returned non-retryable status: {}",
+                            status
+                        )))
+                    }
+                    // --- End status code check ---
+                }
+                Err(err) => {
+                    // --- Request itself failed (network error, timeout, etc.) ---
+                    // Decide if the reqwest::Error is transient or permanent
+                    if err.is_timeout() || err.is_connect() || err.is_request() {
+                        // Treat timeouts, connection errors, and request build errors as potentially transient
+                        tracing::debug!("Retrying on reqwest error: {}", err);
+                        Err(BackoffError::transient(anyhow::Error::new(err))) // Wrap the reqwest::Error
+                    } else {
+                        // Treat other errors (like decoding, redirects, etc.) as permanent for this retry logic
+                        tracing::debug!("Permanent reqwest error: {}", err);
+                        Err(BackoffError::permanent(anyhow::Error::new(err))) // Wrap the reqwest::Error
+                    }
+                    // --- End reqwest::Error handling ---
+                }
+            }
+        },
+        retry_notify_handler,
+    )
+    .await?; // Keep '?' here to handle the final result of retry_notify
+
+    // --- Original Processing Logic (after successful fetch) ---
+    // No need to check response.status().is_success() again, as the retry logic ensures it if Ok
+    let parsed_url = match Url::parse(&url) {
+        Ok(u) => u,
+        Err(e) => return Err(format!("Failed to parse URL {}: {}", url, e).into()),
+    };
+
+    let html_content = response.text().await?;
+    let original_url_string = url.clone();
+
+    let processed_result = tokio::task::spawn_blocking(move || {
+        // 1. Extract readable content
+        let product = extractor::extract(&mut html_content.as_bytes(), &parsed_url)?;
+
+        // 2. Extract Title
+        let title = match Document::from_read(product.content.as_bytes()) {
+             Ok(document) => document.find(Name("title")).next().map(|n| n.text().trim().to_string()),
+             Err(_) => None,
+        };
+
+        // 3. Convert to Markdown
+        let markdown_content = html2md::rewrite_html(&product.content, false);
+
+        // 4. Create ProcessedPage
+        Ok::<_, Box<dyn Error + Send + Sync>>(ProcessedPage {
+            metadata: PageMetadata { url: original_url_string, title },
+            markdown_content,
+        })
+    }).await?;
+
+    processed_result
+}
+
+#[utoipa::path(
+    post,
+    path = "/research/migration-analysis",
+    request_body = MigrationAnalysisRequest,
+    responses(
+        (status = 200, description = "Migration analysis complete", body = MigrationAnalysisResponse),
+        (status = 422, description = "Unprocessable Entity - Error finding or processing sitemaps"),
+        (status = 500, description = "Internal Server Error during processing")
+    )
+)]
+async fn analyze_migration_handler(
+    Json(request): Json<MigrationAnalysisRequest>
+) -> impl IntoResponse {
+    tracing::info!("Starting migration analysis for {} vs {}", request.source_domain, request.target_domain);
+
+    // --- Get Source Sitemap URL ---
+    let source_sitemap_url = match find_sitemap(&request.source_domain).await {
+        Ok(Some(url)) => url, // Correctly unwraps Ok(Some(url))
+        Ok(None) => {
+            tracing::error!("Sitemap not found for source domain: {}", request.source_domain);
+            return (StatusCode::UNPROCESSABLE_ENTITY, Json(MigrationAnalysisResponse {
+                source_domain: request.source_domain, target_domain: request.target_domain,
+                pages_to_migrate: vec![], pages_to_skip: vec![],
+                source_processing_errors: vec![], target_processing_errors: vec![],
+            })).into_response();
+        },
+        Err(e) => {
+            tracing::error!("Error finding source sitemap for {}: {}", request.source_domain, e);
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(format!("Error finding source sitemap: {}", e))).into_response();
+        }
+    };
+
+    // --- Get Target Sitemap URL ---
+    let target_sitemap_url = match find_sitemap(&request.target_domain).await {
+         Ok(Some(url)) => url, // Correctly unwraps Ok(Some(url))
+        Ok(None) => {
+            tracing::error!("Sitemap not found for target domain: {}", request.target_domain);
+             return (StatusCode::UNPROCESSABLE_ENTITY, Json(MigrationAnalysisResponse {
+                source_domain: request.source_domain, target_domain: request.target_domain,
+                pages_to_migrate: vec![], pages_to_skip: vec![],
+                source_processing_errors: vec![], target_processing_errors: vec![],
+            })).into_response();
+        },
+        Err(e) => {
+            tracing::error!("Error finding target sitemap for {}: {}", request.target_domain, e);
+             return (StatusCode::INTERNAL_SERVER_ERROR, Json(format!("Error finding target sitemap: {}", e))).into_response();
+        }
+    };
+
+    // --- Get URLs from Sitemaps (Now passing &str) ---
+    let source_urls = match get_all_sitemap_urls(&source_sitemap_url).await { // Now source_sitemap_url is String
+        Ok(urls) => urls,
+        Err(e) => {
+            tracing::error!("Error getting source URLs from {}: {}", source_sitemap_url, e);
+            return (StatusCode::UNPROCESSABLE_ENTITY, Json(format!("Error processing source sitemap: {}", e))).into_response();
+        }
+    };
+     let target_urls = match get_all_sitemap_urls(&target_sitemap_url).await { // Now target_sitemap_url is String
+        Ok(urls) => urls,
+         Err(e) => {
+            tracing::error!("Error getting target URLs from {}: {}", target_sitemap_url, e);
+            return (StatusCode::UNPROCESSABLE_ENTITY, Json(format!("Error processing target sitemap: {}", e))).into_response();
+        }
+    };
+
+     if source_urls.is_empty() || target_urls.is_empty() {
+         tracing::warn!("One or both sitemaps resulted in zero URLs. Source: {}, Target: {}", source_urls.len(), target_urls.len());
+         return (StatusCode::OK, Json(MigrationAnalysisResponse {
+                source_domain: request.source_domain, target_domain: request.target_domain,
+                pages_to_migrate: vec![], pages_to_skip: vec![],
+                source_processing_errors: vec![], target_processing_errors: vec![],
+            })).into_response();
+     }
+
+    let client = Client::new();
+    let source_futures = source_urls.into_iter().map(|url| {
+        let client = client.clone();
+        tokio::spawn(async move { (url.clone(), fetch_and_process_page(url, client).await) })
+    });
+     let target_futures = target_urls.into_iter().map(|url| {
+        let client = client.clone();
+        tokio::spawn(async move { (url.clone(), fetch_and_process_page(url, client).await) })
+    });
+
+    let source_results = join_all(source_futures).await;
+    let target_results = join_all(target_futures).await;
+
+    let mut source_processed: Vec<ProcessedPage> = Vec::new();
+    let mut source_errors: Vec<String> = Vec::new();
+    for result in source_results {
+        match result {
+            Ok((url, Ok(page))) => source_processed.push(page),
+            Ok((url, Err(e))) => {
+                tracing::warn!("Failed to process source URL {}: {}", url, e);
+                source_errors.push(url);
+            }
+             Err(e) => tracing::error!("JoinError processing source pages: {}", e),
+        }
+    }
+
+    let mut target_processed: Vec<ProcessedPage> = Vec::new();
+    let mut target_errors: Vec<String> = Vec::new();
+     for result in target_results {
+        match result {
+            Ok((url, Ok(page))) => target_processed.push(page),
+            Ok((url, Err(e))) => {
+                tracing::warn!("Failed to process target URL {}: {}", url, e);
+                target_errors.push(url);
+            }
+            Err(e) => tracing::error!("JoinError processing target pages: {}", e),
+        }
+    }
+
+    let mut pages_to_migrate: Vec<PageMetadata> = Vec::new();
+    let mut pages_to_skip: Vec<MigrationSkipRecommendation> = Vec::new();
+
+    for source_page in &source_processed {
+        let mut best_match_target_page: Option<&ProcessedPage> = None;
+        let mut highest_similarity = -1.0;
+
+        for target_page in &target_processed {
+            let similarity = sorensen_dice(&source_page.markdown_content, &target_page.markdown_content);
+
+            if similarity > highest_similarity {
+                highest_similarity = similarity;
+                best_match_target_page = Some(target_page);
+            }
+        }
+
+        if highest_similarity >= request.similarity_threshold {
+            if let Some(matched_target) = best_match_target_page {
+                 pages_to_skip.push(MigrationSkipRecommendation {
+                    source_page: source_page.metadata.clone(),
+                    target_page: matched_target.metadata.clone(),
+                    similarity_score: highest_similarity,
+                });
+            } else {
+                 tracing::error!("Similarity threshold met but no best match found for {}", source_page.metadata.url);
+                 pages_to_migrate.push(source_page.metadata.clone());
+            }
+        } else {
+             pages_to_migrate.push(source_page.metadata.clone());
+        }
+    }
+
+    (StatusCode::OK, Json(MigrationAnalysisResponse {
+        source_domain: request.source_domain,
+        target_domain: request.target_domain,
+        pages_to_migrate,
+        pages_to_skip,
+        source_processing_errors: source_errors,
+        target_processing_errors: target_errors,
+    })).into_response()
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct CrawlDomainsRequest {
     /// List of domains to crawl
     domains: Vec<String>,
@@ -399,7 +791,7 @@ fn default_max_pages() -> usize {
     10
 }
 
-#[derive(Debug, Serialize, ToSchema)]
+#[derive(Debug, Serialize, ToSchema, Clone)]
 pub struct PageInfo {
     /// URL of the crawled page
     url: String,
@@ -431,7 +823,7 @@ async fn crawl_domains(
     Json(request): Json<CrawlDomainsRequest>
 ) -> impl IntoResponse {
     if request.domains.is_empty() {
-        return (StatusCode::UNPROCESSABLE_ENTITY, Json(Vec::<CrawlDomainsResponse>::new()));
+        return (StatusCode::UNPROCESSABLE_ENTITY, Json(Vec::<CrawlDomainsResponse>::new())).into_response();
     }
 
     let crawl_futures = request.domains.iter().map(|domain| {
@@ -440,11 +832,10 @@ async fn crawl_domains(
     
     let results = join_all(crawl_futures).await;
     
-    (StatusCode::OK, Json(results))
+    (StatusCode::OK, Json(results)).into_response()
 }
 
 async fn crawl_single_domain(domain: &str, max_pages: usize) -> CrawlDomainsResponse {
-    // Ensure domain has a protocol
     let domain_with_protocol = if domain.starts_with("http") {
         domain.to_string()
     } else {
@@ -453,13 +844,11 @@ async fn crawl_single_domain(domain: &str, max_pages: usize) -> CrawlDomainsResp
     
     let mut website = Website::new(&domain_with_protocol);
     
-    // Configure the website crawler
     website.with_respect_robots_txt(true)
-           .with_delay(100) // Be polite with 100ms delay between requests
+           .with_delay(100)
            .with_request_timeout(Some(std::time::Duration::from_secs(10)))
-           .with_limit(max_pages as u32); // Set the page limit
+           .with_limit(max_pages as u32);
     
-    // Scrape the website to get HTML content
     website.scrape().await;
     
     let mut pages_info = Vec::new();
@@ -468,20 +857,15 @@ async fn crawl_single_domain(domain: &str, max_pages: usize) -> CrawlDomainsResp
         for page in pages.iter() {
             let url = page.get_url().to_string();
             
-            // Based on the compiler error, assume page.get_html() returns String
-            let html_content = page.get_html(); // Compiler says this is String
+            let html_content = page.get_html();
             
-            // Check if the String is empty instead of matching Option
             let (title, description) = if !html_content.is_empty() {
-                // If the string is not empty, try parsing it
                 match Document::from_read(html_content.as_bytes()) {
                     Ok(document) => {
-                        // Extract title
                         let title = document.find(Name("title"))
                             .next()
                             .map(|n| n.text().trim().to_string());
                         
-                        // Extract meta description
                         let description = document.find(Attr("name", "description"))
                             .next()
                             .and_then(|n| n.attr("content"))
@@ -490,13 +874,11 @@ async fn crawl_single_domain(domain: &str, max_pages: usize) -> CrawlDomainsResp
                         (title, description)
                     },
                     Err(e) => {
-                        // Log parsing error if needed
                         tracing::warn!("Failed to parse HTML for {}: {}", url, e);
-                        (None, None) // Return None if parsing fails
+                        (None, None)
                     },
                 }
             } else {
-                // The HTML string was empty, treat as no content
                 (None, None)
             };
             
