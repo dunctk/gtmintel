@@ -5,9 +5,9 @@ use tracing::Level;
 
 #[tokio::main]
 async fn main() {
-    // Initialize tracing subscriber with level configuration
+    // Initialize tracing subscriber, setting level back to INFO
     tracing_subscriber::fmt()
-        .with_max_level(Level::DEBUG)
+        .with_max_level(Level::INFO)
         .init();
 
     // Run our server

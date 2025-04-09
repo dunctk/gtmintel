@@ -73,6 +73,62 @@ Example Response (with `list_pages=true`):
 }
 ```
 
+#### POST /research/similar-pages
+
+Compares pages between two domains (`domain_a` and `domain_b`) based on the similarity of their main content (converted to Markdown). It iterates through each page from `domain_a`'s sitemap and finds the single most similar page from `domain_b`'s sitemap, provided the similarity score meets a specified threshold.
+
+**Use Cases:**
+
+*   **Competitor Research:** Identify content overlaps between your site (`domain_a`) and a competitor's site (`domain_b`). Discover topics where your competitor has similar content, potentially highlighting areas for differentiation or improvement.
+*   **SEO Migrations:** When migrating a site (e.g., from `domain_a` to `domain_b`), use this endpoint to verify that key pages have been migrated with sufficiently similar content. It can help identify pages that were missed or where the content differs significantly post-migration, potentially impacting SEO rankings.
+
+Request Body:
+```json
+{
+  "domain_a": "your-domain.com",
+  "domain_b": "competitor-domain.com",
+  "similarity_threshold": 0.7 // Optional, default: 0.7 (range 0.0 to 1.0)
+}
+```
+
+Example Response:
+```json
+{
+  "domain_a": "your-domain.com",
+  "domain_b": "competitor-domain.com",
+  "similar_pages": [
+    {
+      "page_a": {
+        "url": "https://your-domain.com/topic-x",
+        "title": "All About Topic X"
+      },
+      "page_b": {
+        "url": "https://competitor-domain.com/about-topic-x",
+        "title": "Our Guide to Topic X"
+      },
+      "similarity_score": 0.85
+    },
+    {
+      "page_a": {
+        "url": "https://your-domain.com/service-y",
+        "title": "Service Y Details"
+      },
+      "page_b": {
+        "url": "https://competitor-domain.com/features/service-y",
+        "title": "Explore Service Y"
+      },
+      "similarity_score": 0.72
+    }
+  ],
+  "domain_a_processing_errors": [],
+  "domain_b_processing_errors": [
+    "https://competitor-domain.com/some-page-that-failed"
+  ]
+}
+```
+
+*Note on Logic:* The current implementation finds the *best* match on `domain_b` for *each* page on `domain_a`. It doesn't guarantee finding every possible similar pair if multiple pages on `domain_a` have the same best match on `domain_b`, or if a page on `domain_b` is similar but not the *top* match for any `domain_a` page.
+
 ## Development
 
 To build the project:

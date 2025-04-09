@@ -641,7 +641,7 @@ async fn fetch_and_process_page(url: String, client: Client) -> Result<Processed
         (status = 422, description = "Unprocessable Entity - Error finding or processing sitemaps"),
         (status = 500, description = "Internal Server Error during processing"),
     ),
-    description = "Compares pages between two domains based on content similarity. Useful for competitive analysis (finding overlapping content) or identifying pages to skip during an SEO migration."
+    description = "Compares pages between two domains based on content similarity. Useful for competitive analysis (finding overlapping content) or identifying pages to skip during an SEO migration.\n\nNote: The current logic iterates through each page from domain_a and finds its single best match (if any above the threshold) on domain_b. It doesn't necessarily find every possible pair of similar pages between the two domains if, for example, one page on domain_b was the second-best match for multiple pages on domain_a."
 )]
 #[tracing::instrument(skip(request), fields(domain_a = %request.domain_a, domain_b = %request.domain_b))]
 async fn compare_domain_pages(
