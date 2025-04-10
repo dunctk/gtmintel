@@ -565,100 +565,133 @@ fn classify_page_type(metadata: &PageMetadata, h1: Option<&str>) -> PageType {
 
     // --- URL Path Analysis ---
     if let Ok(parsed_url) = Url::parse(&metadata.url) {
-        if let Some(mut path_segments) = parsed_url.path_segments() {
-            // Check first few path segments for strong indicators
-            if let Some(first_segment) = path_segments.next() {
-                match first_segment {
-                    "blog" | "posts" | "news" | "insights" | "articles" => return PageType::Blog,
-                    "solutions" | "services" | "platform" | "features" => return PageType::Solution,
-                    "products" | "store" | "shop" => return PageType::Product,
-                    "case-studies" | "casestudies" | "customer-stories" | "success-stories" => return PageType::CaseStudy,
-                    "docs" | "documentation" | "guides" | "api" | "help" | "support" => return PageType::Documentation,
-                    "legal" | "privacy" | "terms" | "imprint" | "impressum" | "cookies" => return PageType::Legal,
-                    "about" | "company" | "team" => return PageType::About,
-                    "contact" | "support" => return PageType::Contact, // 'support' could be ambiguous
-                    _ => {} // Continue checking other segments or heuristics
+        if let Some(path_segments) = parsed_url.path_segments() {
+            // --- EDIT: Use peekable iterator to handle language codes ---
+            let mut segment_iter = path_segments.peekable();
+
+            // --- Skip common language/region codes ---
+            if let Some(first_seg) = segment_iter.peek() {
+                let first_seg_lower = first_seg.to_lowercase();
+                // Common patterns: xx, xx-xx, xx_XX
+                let is_lang_code = (first_seg_lower.len() == 2 && first_seg_lower.chars().all(|c| c.is_ascii_alphabetic())) ||
+                                   (first_seg_lower.len() == 5 && first_seg_lower.contains('-') || first_seg_lower.contains('_'));
+
+                if is_lang_code {
+                    tracing::trace!("Skipping potential language code segment: {}", first_seg_lower);
+                    segment_iter.next(); // Consume the language code segment
                 }
-                 // Check second segment if first wasn't decisive (e.g., /company/blog/...)
-                 if let Some(second_segment) = path_segments.next() {
-                     match second_segment {
-                         "blog" | "posts" | "news" | "insights" | "articles" => return PageType::Blog,
-                         "solutions" | "services" => return PageType::Solution,
-                         "products" => return PageType::Product,
-                         "case-studies" | "casestudies" => return PageType::CaseStudy,
-                         "docs" | "documentation" | "guides" => return PageType::Documentation,
-                          _ => {}
-                     }
-                 }
             }
+            // --- END EDIT for language codes ---
+
+
+            // --- Check the *first meaningful* segment ---
+            if let Some(segment1_raw) = segment_iter.next() {
+                // --- EDIT: Expand keywords for segment 1 ---
+                let segment1 = segment1_raw.to_lowercase();
+                match segment1.as_str() {
+                    "blog" | "posts" | "news" | "insights" | "articles" | "press" | "releases" | "updates" => return PageType::Blog,
+                    "solutions" | "services" | "platform" | "features" | "capabilities" | "offerings" => return PageType::Solution,
+                    "products" | "store" | "shop" => return PageType::Product,
+                    "case-studies" | "casestudies" | "customer-stories" | "success-stories" | "clients" | "portfolio" | "customers" => return PageType::CaseStudy,
+                    "docs" | "documentation" | "guides" | "api" | "help" | "support" | "resources" | "whitepapers" | "reports" | "tutorials" | "knowledge-base" | "faq" => {
+                        // "resources", "support", "help" can be ambiguous. Defaulting to Documentation/Support here.
+                        // Title/H1 might refine later if needed, but URL is often strong signal.
+                        tracing::trace!("Classified as Documentation/Resource by URL segment: {}", segment1);
+                        return PageType::Documentation;
+                    },
+                    "legal" | "privacy" | "terms" | "imprint" | "impressum" | "cookies" | "security" | "compliance" | "disclaimer" | "terms-of-use" => return PageType::Legal,
+                    "about" | "company" | "team" | "careers" | "jobs" | "mission" | "values" => return PageType::About,
+                    "contact" | "locations" | "contact-us" => return PageType::Contact,
+                    // --- END EDIT: Expanded keywords ---
+                    _ => {
+                        // --- Check the *second* meaningful segment if first wasn't decisive ---
+                        if let Some(segment2_raw) = segment_iter.next() {
+                            // --- EDIT: Expand keywords for segment 2 ---
+                             let segment2 = segment2_raw.to_lowercase();
+                             match segment2.as_str() {
+                                 "blog" | "posts" | "news" | "insights" | "articles" | "press" => return PageType::Blog,
+                                 "solutions" | "services" | "platform" | "features" => return PageType::Solution,
+                                 "products" => return PageType::Product,
+                                 "case-studies" | "casestudies" | "customer-stories" | "customers" => return PageType::CaseStudy,
+                                 "docs" | "documentation" | "guides" | "api" | "resources" | "tutorials" => return PageType::Documentation,
+                                  "legal" | "privacy" | "terms" => return PageType::Legal,
+                                  "about" | "company" | "team" | "careers" => return PageType::About,
+                                  "contact" => return PageType::Contact,
+                                  // Add more second-level checks if needed
+                                  _ => {}
+                             }
+                             // --- END EDIT: Expanded keywords ---
+                        }
+                    }
+                }
+            }
+        } // end segment check
+
+        // --- EDIT: Improved Landing Page / Homepage Detection ---
+        // Check if URL path is empty or just "/" *after* checking segments
+        if parsed_url.path() == "/" || parsed_url.path().is_empty() {
+            // Check title for common homepage indicators or emptiness
+            let host_str_lower = parsed_url.host_str().unwrap_or("").to_lowercase();
+            // Check if title is simply "Home", empty, or matches the domain name
+            if title_lower == "home" || title_lower.is_empty() || (title_lower == host_str_lower) || title_lower == host_str_lower.replace("www.","") {
+                 tracing::trace!("Classified as LandingPage (Homepage) by path '/' and title: '{}'", title_lower);
+                 return PageType::LandingPage;
+            }
+            // If path is "/" but title is specific (e.g., "Our Awesome Solutions"), let it fall through.
+            tracing::trace!("Path is '/', but title '{}' is specific. Falling through.", title_lower);
         }
+        // --- END EDIT ---
+
     } else {
         tracing::warn!("Failed to parse URL for classification: {}", metadata.url);
     }
 
-    // --- Title/H1 Keyword Analysis (if URL wasn't decisive) ---
-    // Prioritize H1 if available, then title
+    // --- Title/H1 Keyword Analysis (Fallback if URL wasn't decisive) ---
     let combined_header = format!("{} {}", h1_lower, title_lower);
+    // --- EDIT: Add negative constraint check ---
+    let url_likely_blog = url_lower.contains("/blog/") || url_lower.contains("/post/") || url_lower.contains("/article") || url_lower.contains("/news/");
+    let url_likely_docs = url_lower.contains("/doc") || url_lower.contains("/guide") || url_lower.contains("/api"); // Simplified check
+    // --- END EDIT ---
 
-    if combined_header.contains("blog") || combined_header.contains("post") || combined_header.contains("article") || combined_header.contains("news") {
+
+    // --- EDIT: Expand keywords and add negative constraints ---
+    if combined_header.contains("blog") || combined_header.contains("post") || combined_header.contains("article") || combined_header.contains("news") || combined_header.contains("insight") || combined_header.contains("update") || combined_header.contains("release") || combined_header.contains("press") {
+        // Less need for negative check here, as "blog" keywords are strong
         return PageType::Blog;
     }
-    if combined_header.contains("solution") || combined_header.contains("service") || combined_header.contains("platform") {
-        // Be careful not to misclassify blog posts *about* solutions
-        if !url_lower.contains("/blog/") && !url_lower.contains("/post/") { // Basic check
-             return PageType::Solution;
-        }
+    // Check Solutions/Services *only if URL doesn't strongly suggest blog*
+    if !url_likely_blog && (combined_header.contains("solution") || combined_header.contains("service") || combined_header.contains("platform") || combined_header.contains("capability") || combined_header.contains("offering")) {
+        tracing::trace!("Classified as Solution by title/h1 (URL not blog)");
+        return PageType::Solution;
     }
-    if combined_header.contains("product") {
-        // Similar check for blog posts about products
-        if !url_lower.contains("/blog/") && !url_lower.contains("/post/") {
-             return PageType::Product;
-        }
+    // Check Product *only if URL doesn't strongly suggest blog*
+    if !url_likely_blog && (combined_header.contains("product") || combined_header.contains("store") || combined_header.contains("shop")) {
+        tracing::trace!("Classified as Product by title/h1 (URL not blog)");
+        return PageType::Product;
     }
-    if combined_header.contains("case study") || combined_header.contains("customer story") {
+    if combined_header.contains("case study") || combined_header.contains("customer story") || combined_header.contains("success story") || combined_header.contains("client results") || combined_header.contains("portfolio") {
          return PageType::CaseStudy;
     }
-     if combined_header.contains("documentation") || combined_header.contains("guide") || combined_header.contains("api reference") {
+     // Check Docs *only if URL doesn't already suggest Docs (to avoid overly broad keywords overriding URL)*
+     if !url_likely_docs && (combined_header.contains("documentation") || combined_header.contains("guide") || combined_header.contains("api reference") || combined_header.contains("resource") || combined_header.contains("whitepaper") || combined_header.contains("tutorial") || combined_header.contains("knowledge base") || combined_header.contains("faq")) {
+         tracing::trace!("Classified as Documentation by title/h1 (URL not already docs)");
          return PageType::Documentation;
     }
-     if combined_header.contains("privacy") || combined_header.contains("terms") || combined_header.contains("legal") || combined_header.contains("cookie policy") {
+     if combined_header.contains("privacy") || combined_header.contains("terms") || combined_header.contains("legal") || combined_header.contains("cookie policy") || combined_header.contains("compliance") || combined_header.contains("security") || combined_header.contains("disclaimer") {
          return PageType::Legal;
     }
-     if combined_header.contains("about us") || combined_header.contains("company") || combined_header.contains("our team") {
+     if combined_header.contains("about us") || combined_header.contains("company") || combined_header.contains("our team") || combined_header.contains("mission") || combined_header.contains("value") || combined_header.contains("career") || combined_header.contains("job") {
          return PageType::About;
     }
-      if combined_header.contains("contact us") || combined_header.contains("get in touch") {
-         return PageType::Contact;
+    // Check Contact last as "support" or "help" might be caught by Docs earlier if URL matched
+      if combined_header.contains("contact us") || combined_header.contains("get in touch") || combined_header.contains("location") || combined_header.contains("support") || combined_header.contains("help") {
+          // If it reaches here, it's likely a dedicated contact/support page rather than docs.
+          return PageType::Contact;
     }
-
-    // --- Simple Landing Page Check (heuristic) ---
-    // Check if URL path is empty or just "/"
-    if let Ok(parsed_url) = Url::parse(&metadata.url) {
-         if parsed_url.path() == "/" || parsed_url.path().is_empty() {
-             // Could also check for common landing page titles like "Home"
-             if title_lower.contains("home") || title_lower.is_empty() { // Empty title might be homepage
-                 return PageType::LandingPage; // Likely Homepage
-             }
-         }
-         // Check for very short paths, potentially marketing pages
-         // Note: This rule was commented out in the original example, keeping it commented.
-         // You might enable and refine it if needed.
-         /*
-         if parsed_url.path_segments().map_or(0, |s| s.count()) == 1 {
-              // Example: /features, /pricing - needs more refinement maybe
-             if !matches!(classify_page_type(metadata, h1), PageType::Unknown | PageType::General) {
-                  // If already classified by keywords/URL, respect that
-             } else {
-                 // Could be a landing page if not otherwise classified
-                 // return PageType::LandingPage; // Be cautious with this rule
-             }
-         }
-         */
-    }
-
+    // --- END EDIT: Expanded keywords and negative constraints ---
 
     // --- Fallback ---
-    tracing::debug!("Could not classify page, falling back to General: {}", metadata.url);
+    tracing::debug!("Could not classify page based on URL or Title/H1 heuristics, falling back to General: {}", metadata.url);
     PageType::General // Or Unknown if you prefer a stricter default
 }
 // --- End Page Classifier Function ---
@@ -1036,66 +1069,59 @@ async fn compare_domain_pages(
     State(state): State<AppState>,
     Json(request): Json<CompareDomainsRequest>
 ) -> impl IntoResponse {
-    // ---> Record start time <---
     let start_time = Instant::now();
 
-    // ---> ADD VALIDATION FOR THRESHOLD <---
     if !(0.0..=1.0).contains(&request.similarity_threshold) {
          return (StatusCode::UNPROCESSABLE_ENTITY, Json(serde_json::json!({
              "error": "similarity_threshold must be between 0.0 and 1.0"
          }))).into_response();
     }
-    // --------------------------------------
 
     tracing::info!("Starting semantic page comparison for {} vs {} with threshold {}",
         request.domain_a, request.domain_b, request.similarity_threshold);
 
-    let embedder = state.embedder; // Get the embedder Arc from state
-    let client = state.http_client; // Get the HTTP client Arc from state
+    let embedder = state.embedder;
+    let client = state.http_client;
 
-    // --- Get Sitemap URLs (pass client) ---
+    // --- Get Sitemap URLs ---
     let sitemap_url_a = match find_sitemap(&request.domain_a, client.clone()).await {
         Ok(Some(url)) => url,
         Ok(None) => {
             tracing::error!("Sitemap not found for domain_a: {}", request.domain_a);
-            // Return CompareDomainsResponse structure on error
             return (StatusCode::UNPROCESSABLE_ENTITY, Json(CompareDomainsResponse {
                 domain_a: request.domain_a, domain_b: request.domain_b,
                 similar_pages: vec![],
-                domain_a_processing_errors: vec!["Sitemap not found".to_string()], // Indicate error source
+                domain_a_processing_errors: vec!["Sitemap not found".to_string()],
                 domain_b_processing_errors: vec![],
             })).into_response();
         },
         Err(e) => {
             tracing::error!("Error finding sitemap for domain_a {}: {}", request.domain_a, e);
-            // Return simple JSON string for internal server errors to avoid complex struct creation on critical failure
             return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": format!("Error finding sitemap for domain_a: {}", e)}))).into_response();
         }
     };
     let sitemap_url_b = match find_sitemap(&request.domain_b, client.clone()).await {
-         Ok(Some(url)) => url,
+        Ok(Some(url)) => url,
         Ok(None) => {
             tracing::error!("Sitemap not found for domain_b: {}", request.domain_b);
              return (StatusCode::UNPROCESSABLE_ENTITY, Json(CompareDomainsResponse {
                 domain_a: request.domain_a, domain_b: request.domain_b,
                 similar_pages: vec![],
                 domain_a_processing_errors: vec![],
-                domain_b_processing_errors: vec!["Sitemap not found".to_string()], // Indicate error source
+                domain_b_processing_errors: vec!["Sitemap not found".to_string()],
             })).into_response();
         },
         Err(e) => {
             tracing::error!("Error finding sitemap for domain_b {}: {}", request.domain_b, e);
-             // Return simple JSON string for internal server errors
              return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": format!("Error finding sitemap for domain_b: {}", e)}))).into_response();
         }
     };
 
-    // --- Get All URLs from Sitemaps (pass client) ---
+    // --- Get All URLs from Sitemaps ---
     let urls_a = match get_all_sitemap_urls(&sitemap_url_a, client.clone()).await {
         Ok(urls) => urls,
         Err(e) => {
             tracing::error!("Error getting URLs for domain_a {}: {}", request.domain_a, e);
-            // Return simple JSON string for unprocessable entity errors related to sitemap processing
             return (StatusCode::UNPROCESSABLE_ENTITY, Json(serde_json::json!({ "error": format!("Error processing sitemap for domain_a: {}", e)}))).into_response();
         }
     };
@@ -1103,7 +1129,6 @@ async fn compare_domain_pages(
         Ok(urls) => urls,
          Err(e) => {
             tracing::error!("Error getting URLs for domain_b {}: {}", request.domain_b, e);
-            // Return simple JSON string for unprocessable entity errors related to sitemap processing
             return (StatusCode::UNPROCESSABLE_ENTITY, Json(serde_json::json!({ "error": format!("Error processing sitemap for domain_b: {}", e)}))).into_response();
         }
     };
@@ -1118,34 +1143,29 @@ async fn compare_domain_pages(
             })).into_response();
      }
 
-    // --- Fetch and Process Pages Concurrently (Pass embedder and client) ---
+    // --- Fetch and Process Pages Concurrently ---
     let fetch_process_span_a = tracing::info_span!("fetch_process_embed_pages", domain = %request.domain_a);
     let embedder_a = embedder.clone();
-    let client_a = client.clone(); // Clone client for domain A tasks
+    let client_a = client.clone();
     let futures_a = urls_a.into_iter().map(|url| {
-        let client_c = client_a.clone(); // Clone client for this specific task
+        let client_c = client_a.clone();
         let embedder_c = embedder_a.clone();
-        // Clone url *before* the closure moves the original url
         let url_for_span = url.clone();
         tokio::spawn(async move {
-            // Pass the cloned client `client_c`
             (url.clone(), fetch_and_process_page(url, client_c, embedder_c).await)
         })
         .instrument(tracing::info_span!("process_page_task", url = %url_for_span))
     });
     let results_a = join_all(futures_a).instrument(fetch_process_span_a).await;
 
-
     let fetch_process_span_b = tracing::info_span!("fetch_process_embed_pages", domain = %request.domain_b);
     let embedder_b = embedder.clone();
-    let client_b = client.clone(); // Clone client for domain B tasks
+    let client_b = client.clone();
     let futures_b = urls_b.into_iter().map(|url| {
-        let client_c = client_b.clone(); // Clone client for this specific task
+        let client_c = client_b.clone();
         let embedder_c = embedder_b.clone();
-        // Clone url *before* the closure moves the original url
         let url_for_span = url.clone();
         tokio::spawn(async move {
-            // Pass the cloned client `client_c`
              (url.clone(), fetch_and_process_page(url, client_c, embedder_c).await)
         })
         .instrument(tracing::info_span!("process_page_task", url = %url_for_span))
@@ -1154,27 +1174,24 @@ async fn compare_domain_pages(
 
 
     // --- Separate successful results from errors ---
-    let mut processed_a_all: Vec<ProcessedPage> = Vec::new(); // Rename temporarily
+    let mut processed_a_all: Vec<ProcessedPage> = Vec::new();
     let mut errors_a: Vec<String> = Vec::new();
     for result in results_a {
         match result {
-             // Handle JoinError first
              Err(join_error) => tracing::error!("JoinError processing domain_a pages: {}", join_error),
-             // Handle Result from fetch_and_process_page
-            Ok((_url, Ok(page))) => processed_a_all.push(page), // Use _url
+            Ok((_url, Ok(page))) => processed_a_all.push(page),
             Ok((url, Err(e))) => {
                 tracing::warn!("Failed to process URL for domain_a {}: {}", url, e);
                 errors_a.push(url);
             }
         }
     }
-    // ... similar separation logic for results_b ...
-    let mut processed_b_all: Vec<ProcessedPage> = Vec::new(); // Rename temporarily
+    let mut processed_b_all: Vec<ProcessedPage> = Vec::new();
     let mut errors_b: Vec<String> = Vec::new();
      for result in results_b {
         match result {
              Err(join_error) => tracing::error!("JoinError processing domain_b pages: {}", join_error),
-            Ok((_url, Ok(page))) => processed_b_all.push(page), // Use _url
+            Ok((_url, Ok(page))) => processed_b_all.push(page),
             Ok((url, Err(e))) => {
                 tracing::warn!("Failed to process URL for domain_b {}: {}", url, e);
                 errors_b.push(url);
@@ -1182,130 +1199,101 @@ async fn compare_domain_pages(
          }
     }
 
-    let initial_count_a = processed_a_all.len(); // Use renamed var
-    let initial_count_b = processed_b_all.len(); // Use renamed var
+    let initial_count_a = processed_a_all.len();
+    let initial_count_b = processed_b_all.len();
 
-    // --- Filter out boilerplate pages BEFORE type grouping ---
+    // --- Filter out boilerplate pages ---
     processed_a_all.retain(|page| !is_boilerplate_page(page));
     processed_b_all.retain(|page| !is_boilerplate_page(page));
 
-    let filtered_count_a = processed_a_all.len(); // Use renamed var
-    let filtered_count_b = processed_b_all.len(); // Use renamed var
+    let filtered_count_a = processed_a_all.len();
+    let filtered_count_b = processed_b_all.len();
 
     tracing::info!(
-        "Processed {} pages for domain A ({} errors, {} filtered as boilerplate)",
-        initial_count_a, errors_a.len(), initial_count_a - filtered_count_a
+        "Processing Domain A: {} initial -> {} filtered ({} errors)",
+        initial_count_a, filtered_count_a, errors_a.len()
     );
     tracing::info!(
-         "Processed {} pages for domain B ({} errors, {} filtered as boilerplate)",
-        initial_count_b, errors_b.len(), initial_count_b - filtered_count_b
+         "Processing Domain B: {} initial -> {} filtered ({} errors)",
+        initial_count_b, filtered_count_b, errors_b.len()
     );
-    // --- End filtering ---
 
 
-    // --- Group Pages by Type ---
-    let group_span = tracing::info_span!("group_pages_by_type");
-    let _enter_group = group_span.enter();
-
-    let mut pages_by_type_a: HashMap<PageType, Vec<ProcessedPage>> = HashMap::new();
-    for page in processed_a_all { // Use the filtered list
-        pages_by_type_a.entry(page.page_type.clone()).or_default().push(page);
-    }
-
-    let mut pages_by_type_b: HashMap<PageType, Vec<ProcessedPage>> = HashMap::new();
-    for page in processed_b_all { // Use the filtered list
-        pages_by_type_b.entry(page.page_type.clone()).or_default().push(page);
-    }
-
-    // Log counts per type (optional but helpful)
-    let mut type_counts_a = String::new();
-    for (page_type, pages) in &pages_by_type_a {
-        type_counts_a.push_str(&format!("{:?}: {}, ", page_type, pages.len()));
-    }
-    if !type_counts_a.is_empty() {
-        // Remove trailing ", "
-        type_counts_a.pop();
-        type_counts_a.pop();
-        tracing::info!("Domain A ({}) page counts by type: {}", request.domain_a, type_counts_a);
-    } else {
-         tracing::info!("Domain A ({}): No pages remaining after filtering.", request.domain_a);
-    }
-
-    let mut type_counts_b = String::new();
-    for (page_type, pages) in &pages_by_type_b {
-         type_counts_b.push_str(&format!("{:?}: {}, ", page_type, pages.len()));
-    }
-     if !type_counts_b.is_empty() {
-        // Remove trailing ", "
-        type_counts_b.pop();
-        type_counts_b.pop();
-        tracing::info!("Domain B ({}) page counts by type: {}", request.domain_b, type_counts_b);
-    } else {
-        tracing::info!("Domain B ({}): No pages remaining after filtering.", request.domain_b);
-    }
-    // --- END EDIT ---
-
-    drop(_enter_group); // End timing for grouping
-
-
-    // --- Compare Processed Pages within Each Type ---
+    // --- Compare ALL Processed Pages with Type Preference ---
     let mut similar_pairs: Vec<SimilarPagePair> = Vec::new();
-    let comparison_span = tracing::info_span!("compare_embeddings_by_type");
+    let comparison_span = tracing::info_span!("compare_embeddings_all");
     {
         let _enter = comparison_span.enter();
         let semantic_threshold = request.similarity_threshold;
+        const TYPE_MATCH_BONUS: f64 = 0.1; // Bonus for matching types (tune as needed)
 
-        // Iterate through types present in domain A
-        for (page_type, pages_a) in &pages_by_type_a {
-            // Check if this type also exists in domain B
-            if let Some(pages_b) = pages_by_type_b.get(page_type) {
-                tracing::info!("Comparing pages of type {:?} (A: {}, B: {}) between domains...", page_type, pages_a.len(), pages_b.len());
+        tracing::info!(
+            "Comparing all {} pages from domain A against all {} pages from domain B...",
+            filtered_count_a, filtered_count_b
+        );
 
-                // Compare pages *within this specific type*
-                for page_a in pages_a {
+        // Iterate through each page in domain A
+        for page_a in &processed_a_all {
+            // Ensure page_a has an embedding
             if let Some(embed_a) = &page_a.embedding {
-            let mut best_match_for_a: Option<&ProcessedPage> = None;
-                        let mut highest_similarity_for_a = -2.0;
+                let mut best_match_for_a: Option<&ProcessedPage> = None;
+                let mut highest_comparison_score_for_a = -2.0; // Initialize lower than any possible score
+                let mut best_actual_similarity_for_a = -2.0;
 
-                        for page_b in pages_b {
+                // Compare page_a against every page in domain B
+                for page_b in &processed_b_all {
                     if let Some(embed_b) = &page_b.embedding {
-                        if let Some(similarity) = cosine_similarity(embed_a, embed_b) {
-                if similarity > highest_similarity_for_a {
-                    highest_similarity_for_a = similarity;
-                    best_match_for_a = Some(page_b);
+                        if let Some(actual_similarity) = cosine_similarity(embed_a, embed_b) {
+                            let mut comparison_score = actual_similarity;
+
+                            // Apply bonus if types match and are meaningful
+                            if page_a.page_type == page_b.page_type &&
+                               page_a.page_type != PageType::General &&
+                               page_a.page_type != PageType::Unknown {
+                                comparison_score += TYPE_MATCH_BONUS;
+                                tracing::trace!("Applied type match bonus ({}) for pair: '{}' ({:?}) vs '{}' ({:?})",
+                                                TYPE_MATCH_BONUS, page_a.metadata.url, page_a.page_type,
+                                                page_b.metadata.url, page_b.page_type);
+                            }
+
+                            // Check if this is the best match *for page_a* so far based on comparison score
+                            if comparison_score > highest_comparison_score_for_a {
+                                highest_comparison_score_for_a = comparison_score;
+                                best_actual_similarity_for_a = actual_similarity;
+                                best_match_for_a = Some(page_b);
                             }
                         } else {
                              tracing::warn!("Could not calculate similarity between {} and {}", page_a.metadata.url, page_b.metadata.url);
                         }
-                }
-                        } // End inner loop (pages_b)
-
-                if highest_similarity_for_a >= semantic_threshold {
-                if let Some(matched_b) = best_match_for_a {
-                        similar_pairs.push(SimilarPagePair {
-                        page_a: page_a.metadata.clone(),
-                            page_b: matched_b.metadata.clone(),
-                                    similarity_score: highest_similarity_for_a,
-                    });
-                }
-            }
-            } else {
-                        tracing::debug!("Skipping comparison for page_a (type {:?}) without embedding: {}", page_type, page_a.metadata.url);
                     }
-                } // End outer loop (pages_a)
-            } else { // <--- Else corresponding to `if let Some(pages_b)`
-                 tracing::debug!("Skipping type {:?} - not found in domain B", page_type);
-            } // <--- End of `if let Some(pages_b)` block
-        } // End type loop (pages_by_type_a)
-    } // <--- End of comparison scope, correctly closes the block started above
+                } // End inner loop (pages_b)
 
-    tracing::info!("Found {} similar page pairs across matched types above threshold {}", similar_pairs.len(), request.similarity_threshold);
+                // After checking all pages_b, see if the best match meets the original threshold
+                if best_actual_similarity_for_a >= semantic_threshold {
+                    if let Some(matched_b) = best_match_for_a {
+                        tracing::debug!("Found similar pair (score {:.4}, threshold {}): A='{}' ({:?}) | B='{}' ({:?})",
+                                       best_actual_similarity_for_a, semantic_threshold,
+                                       page_a.metadata.url, page_a.page_type,
+                                       matched_b.metadata.url, matched_b.page_type);
+                        similar_pairs.push(SimilarPagePair {
+                            page_a: page_a.metadata.clone(),
+                            page_b: matched_b.metadata.clone(),
+                            similarity_score: best_actual_similarity_for_a, // Store the *actual* score
+                        });
+                    }
+                }
+            } else {
+                tracing::debug!("Skipping comparison for page_a without embedding: {}", page_a.metadata.url);
+            }
+        } // End outer loop (pages_a)
+    } // End comparison scope
+
+    tracing::info!("Found {} similar page pairs above threshold {}", similar_pairs.len(), request.similarity_threshold);
 
     // ---> Calculate and Log Performance Metrics <---
     let total_duration = start_time.elapsed();
-    // Use filtered counts for per-page timing
-    let total_processed_count = filtered_count_a + filtered_count_b; // Use filtered counts
-    let avg_time_per_page = if total_processed_count > 0 { // Use processed count
+    let total_processed_count = filtered_count_a + filtered_count_b;
+    let avg_time_per_page = if total_processed_count > 0 {
         total_duration.as_secs_f64() / total_processed_count as f64
     } else {
         0.0
@@ -1313,12 +1301,11 @@ async fn compare_domain_pages(
 
     tracing::info!(
         total_duration_ms = total_duration.as_millis(),
-        total_pages_processed_a = filtered_count_a, // Renamed for clarity
-        total_pages_processed_b = filtered_count_b, // Renamed for clarity
+        total_pages_processed_a = filtered_count_a,
+        total_pages_processed_b = filtered_count_b,
         avg_time_per_page_ms = avg_time_per_page * 1000.0,
-        "Type-specific similarity comparison complete." // Updated log message
+        "Similarity comparison complete (with type preference)."
     );
-    // -------------------------------------------------
 
     // --- Return Response ---
     (StatusCode::OK, Json(CompareDomainsResponse {
