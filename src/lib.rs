@@ -52,6 +52,11 @@ use once_cell::sync::Lazy;
 use html2text;
 use embed_anything::embeddings::embed::EmbeddingResult;
 use regex;
+// --- HTTP Cache Imports ---
+use reqwest_middleware::ClientWithMiddleware;
+use http_cache_reqwest::{Cache, CacheMode, CACacheManager, HttpCache, HttpCacheOptions};
+use reqwest_middleware::ClientBuilder;
+// --- End HTTP Cache Imports ---
 
 // --- Global Embedder Initialization ---
 // Place this near the top, after imports
@@ -67,10 +72,23 @@ static TEXT_EMBEDDER: Lazy<Arc<Embedder>> = Lazy::new(|| {
 });
 // --- End Global Embedder Initialization ---
 
-// --- Define AppState AFTER TEXT_EMBEDDER and AFTER imports, but BEFORE functions ---
+// --- Global HTTP Client Initialization ---
+static HTTP_CLIENT: Lazy<ClientWithMiddleware> = Lazy::new(|| {
+    ClientBuilder::new(Client::new())
+        .with(Cache(HttpCache {
+            mode: CacheMode::Default, // Use default caching rules
+            manager: CACacheManager::default(), // Store cache data in default OS location
+            options: HttpCacheOptions::default(), // Use default cache options
+        }))
+        .build()
+});
+// --- End Global HTTP Client Initialization ---
+
+// --- Define AppState AFTER TEXT_EMBEDDER and HTTP_CLIENT, but BEFORE functions ---
 #[derive(Clone)]
 struct AppState {
     embedder: Arc<Embedder>,
+    http_client: ClientWithMiddleware, // Add the cached client
 }
 // --- End AppState Definition ---
 
@@ -119,9 +137,13 @@ pub struct ResearchResponse {
         (status = 422, description = "Unprocessable Entity - Sitemap not found", body = ResearchResponse)
     )
 )]
-#[tracing::instrument(skip(query), fields(domain = %query.domain))]
-async fn research_pages(Query(query): Query<ResearchQuery>) -> impl IntoResponse {
-    let sitemap_result = find_sitemap(&query.domain).await;
+#[tracing::instrument(skip(query, state), fields(domain = %query.domain))]
+async fn research_pages(
+    Query(query): Query<ResearchQuery>,
+    State(state): State<AppState> // Inject AppState
+) -> impl IntoResponse {
+    // Pass the client from state to find_sitemap
+    let sitemap_result = find_sitemap(&query.domain, state.http_client.clone()).await;
 
     // Use the provided or default 'within_days' value
     let days_to_analyze = query.within_days;
@@ -140,7 +162,8 @@ async fn research_pages(Query(query): Query<ResearchQuery>) -> impl IntoResponse
     match sitemap_result {
         Ok(Some(sitemap_url)) => {
             response_body.sitemap_url = Some(sitemap_url.clone());
-            match count_recent_pages(&sitemap_url, days_to_analyze).await {
+            // Pass the client from state to count_recent_pages
+            match count_recent_pages(&sitemap_url, days_to_analyze, state.http_client.clone()).await {
                 Ok((count, urls)) => {
                     response_body.updated_pages = count;
                     if should_list_pages {
@@ -167,8 +190,11 @@ async fn research_pages(Query(query): Query<ResearchQuery>) -> impl IntoResponse
 }
 
 /// Attempts to find the sitemap URL for a given domain, checking robots.txt first, then common locations.
-#[tracing::instrument(skip(domain), fields(domain = %domain))]
-async fn find_sitemap(domain: &str) -> Result<Option<String>, Box<dyn Error + Send + Sync>> {
+#[tracing::instrument(skip(domain, client), fields(domain = %domain))]
+async fn find_sitemap(
+    domain: &str,
+    client: ClientWithMiddleware // Accept the cached client
+) -> Result<Option<String>, Box<dyn Error + Send + Sync>> {
     // Ensure domain has protocol and no trailing slash
     let base_url = if !domain.starts_with("http") {
         format!("https://{}", domain)
@@ -177,11 +203,11 @@ async fn find_sitemap(domain: &str) -> Result<Option<String>, Box<dyn Error + Se
         domain.trim_end_matches('/').to_string()
     };
 
-    // 1. Try fetching and parsing robots.txt
+    // 1. Try fetching and parsing robots.txt using the cached client
     let robots_url = format!("{}/robots.txt", base_url);
     tracing::info!("Attempting to fetch robots.txt from: {}", robots_url);
 
-    match reqwest::get(&robots_url).await {
+    match client.get(&robots_url).send().await {
         Ok(response) => {
             if response.status().is_success() {
                 match response.text().await {
@@ -227,8 +253,8 @@ async fn find_sitemap(domain: &str) -> Result<Option<String>, Box<dyn Error + Se
     ];
 
     for url in sitemap_guesses {
-        // Use HEAD request to check existence efficiently without downloading the body
-        match reqwest::Client::new().head(&url).send().await {
+        // Use HEAD request with the cached client
+        match client.head(&url).send().await {
             Ok(response) if response.status().is_success() => {
                 tracing::info!("Found sitemap by guessing: {}", url);
                 return Ok(Some(url)); // Return the guess URL
@@ -249,8 +275,12 @@ async fn find_sitemap(domain: &str) -> Result<Option<String>, Box<dyn Error + Se
 
 /// Count pages modified within the last `days` from a sitemap URL, handling sitemap indexes.
 /// Returns a tuple: (count, list_of_updated_page_urls).
-#[tracing::instrument(skip(initial_sitemap_url), fields(initial_sitemap_url = %initial_sitemap_url, days = %days))]
-async fn count_recent_pages(initial_sitemap_url: &str, days: u32) -> Result<(i32, Vec<String>), Box<dyn Error + Send + Sync>> {
+#[tracing::instrument(skip(initial_sitemap_url, client), fields(initial_sitemap_url = %initial_sitemap_url, days = %days))]
+async fn count_recent_pages(
+    initial_sitemap_url: &str,
+    days: u32,
+    client: ClientWithMiddleware // Accept the cached client
+) -> Result<(i32, Vec<String>), Box<dyn Error + Send + Sync>> {
     let mut pages_counted = 0;
     let mut updated_page_urls: Vec<String> = Vec::new();
     // Calculate the cutoff date based on the 'days' parameter
@@ -268,7 +298,8 @@ async fn count_recent_pages(initial_sitemap_url: &str, days: u32) -> Result<(i32
         }
         tracing::info!("Processing sitemap: {}", sitemap_url);
 
-        let sitemap_response = match reqwest::get(&sitemap_url).await {
+        // Use the passed client
+        let sitemap_response = match client.get(&sitemap_url).send().await {
             Ok(res) => res,
             Err(e) => {
                 tracing::error!("Failed to fetch sitemap {}: {}", sitemap_url, e);
@@ -378,9 +409,14 @@ pub fn create_app() -> Router {
 
     // --- Get the globally initialized embedder ---
     let shared_embedder = TEXT_EMBEDDER.clone();
+    // --- Get the globally initialized HTTP client ---
+    let shared_http_client = HTTP_CLIENT.clone();
 
-    // Create the application state
-    let app_state = AppState { embedder: shared_embedder };
+    // Create the application state with both client and embedder
+    let app_state = AppState {
+        embedder: shared_embedder,
+        http_client: shared_http_client, // Add the client to the state
+    };
 
     // --- Define API routes separately ---
     let api_routes = Router::new()
@@ -496,13 +532,15 @@ pub struct CompareDomainsResponse {
     domain_b_processing_errors: Vec<String>,
 }
 
-#[tracing::instrument(skip(initial_sitemap_url), fields(initial_sitemap_url = %initial_sitemap_url))]
-async fn get_all_sitemap_urls(initial_sitemap_url: &str) -> Result<Vec<String>, Box<dyn Error + Send + Sync>> {
+#[tracing::instrument(skip(initial_sitemap_url, client), fields(initial_sitemap_url = %initial_sitemap_url))]
+async fn get_all_sitemap_urls(
+    initial_sitemap_url: &str,
+    client: ClientWithMiddleware // Accept the cached client
+) -> Result<Vec<String>, Box<dyn Error + Send + Sync>> {
     let mut all_page_urls: Vec<String> = Vec::new();
     let mut sitemap_queue: VecDeque<String> = VecDeque::new();
     sitemap_queue.push_back(initial_sitemap_url.to_string());
     let mut processed_sitemaps: HashSet<String> = HashSet::new();
-    let client = Client::new();
 
     while let Some(sitemap_url) = sitemap_queue.pop_front() {
         if !processed_sitemaps.insert(sitemap_url.clone()) {
@@ -511,6 +549,7 @@ async fn get_all_sitemap_urls(initial_sitemap_url: &str) -> Result<Vec<String>, 
         }
         tracing::info!("Processing sitemap: {}", sitemap_url);
 
+        // Use the passed client
         let sitemap_response = match client.get(&sitemap_url).send().await {
             Ok(res) => res,
             Err(e) => {
@@ -638,7 +677,7 @@ fn is_boilerplate_page(page: &ProcessedPage) -> bool {
 #[tracing::instrument(skip(url, client, embedder), fields(url = %url))]
 async fn fetch_and_process_page(
     url: String,
-    client: Client,
+    client: ClientWithMiddleware, // Accept the cached client
     embedder: Arc<Embedder>
 ) -> Result<ProcessedPage, Box<dyn Error + Send + Sync>> {
     tracing::debug!("Fetching: {}", url);
@@ -649,53 +688,51 @@ async fn fetch_and_process_page(
     let response = retry_notify(
         backoff,
         || async {
-            // Remove '?' and handle the result explicitly
             match client.get(&url).send().await {
                 Ok(resp) => {
-                    // --- Request was successful, now check status code ---
                     let status = resp.status();
                     if status.is_success() {
                         Ok(resp) // Success!
-                    } else if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
-                        // Server returned a status indicating a transient issue
-                        tracing::debug!("Retrying on status: {}", status);
-                        Err(BackoffError::transient(anyhow::anyhow!(
-                            "Server returned retryable status: {}",
-                            status
-                        )))
                     } else {
-                        // Server returned a status indicating a permanent issue
-                        tracing::debug!("Permanent error status: {}", status);
-                        Err(BackoffError::permanent(anyhow::anyhow!(
-                            "Server returned non-retryable status: {}",
-                            status
-                        )))
+                        // Handle status code errors explicitly here
+                        let error_string = format!("Server returned status: {}", status);
+                        if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
+                            tracing::debug!("Retrying on status: {}", status);
+                            Err(BackoffError::transient(error_string)) // Pass String
+                        } else {
+                            // Treat other non-success status codes (like 404, 403, 401) as permanent
+                            tracing::debug!("Permanent error status: {}", status);
+                            Err(BackoffError::permanent(error_string)) // Pass String
+                        }
                     }
-                    // --- End status code check ---
                 }
-                Err(err) => {
-                    // --- Request itself failed (network error, timeout, etc.) ---
-                    // Decide if the reqwest::Error is transient or permanent
-                    if err.is_timeout() || err.is_connect() || err.is_request() {
-                        // Treat timeouts, connection errors, and request build errors as potentially transient
-                        tracing::debug!("Retrying on reqwest error: {}", err);
-                        Err(BackoffError::transient(anyhow::Error::new(err))) // Wrap the reqwest::Error
-                    } else {
-                        // Treat other errors (like decoding, redirects, etc.) as permanent for this retry logic
-                        tracing::debug!("Permanent reqwest error: {}", err);
-                        Err(BackoffError::permanent(anyhow::Error::new(err))) // Wrap the reqwest::Error
-                    }
-                    // --- End reqwest::Error handling ---
+                Err(err) => { // err is reqwest_middleware::Error
+                    // --- Simplified Error Handling ---
+                    // We cannot reliably inspect `err`'s source/type inside here
+                    // due to lifetime constraints ('static requirement).
+                    // Assume most errors reaching this point (network, timeout, DNS, etc.)
+                    // are potentially transient. Status code errors were handled above.
+                    let error_string = err.to_string();
+                    tracing::debug!("Retrying on middleware/network error: {}", error_string);
+                    // Default to transient for errors caught here
+                    Err(BackoffError::transient(error_string)) // Pass String
                 }
             }
         },
-        retry_notify_handler,
+        retry_notify_handler, // Handler needs E: Display, which String implements
     )
-    .await?;
+    // The error type from retry_notify is String
+    .await
+    // Convert the final String error (if retries failed) into a Box<dyn Error>
+    .map_err(|e: String| -> Box<dyn Error + Send + Sync> {
+        // Create a standard error from the string message
+        Box::new(std::io::Error::new(std::io::ErrorKind::Other, e))
+    })?;
 
     // --- Original Processing Logic (after successful fetch) ---
     let processing_span = tracing::info_span!("blocking_extraction"); // Span for blocking extraction only
-    let html_content = response.text().await?;
+    // Handle potential error from response.text() which returns reqwest::Error
+    let html_content = response.text().await.map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
     let original_url_string = url.clone();
 
     // Clone necessary data for the blocking task
@@ -716,21 +753,21 @@ async fn fetch_and_process_page(
             .map(|s| s.trim().to_string());
 
         // --- Extract Intro Text ---
-        let parsed_url_for_extract = Url::parse(&url_for_blocking)?;
+        // Ensure URL parsing errors are boxed correctly
+        let parsed_url_for_extract = Url::parse(&url_for_blocking)
+            .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
         let intro_text = match extractor::extract(&mut html_content.as_bytes(), &parsed_url_for_extract) {
             Ok(product) => {
-                // Basic HTML to text conversion - Handle the Result
                 let plain_text_result = html2text::from_read(product.content.as_bytes(), 120);
-                // Use unwrap_or_default to get an empty string if conversion fails
-                let plain_text = plain_text_result.unwrap_or_default();
-                // Now call split_whitespace on the String
-                plain_text.split_whitespace().take(200).collect::<Vec<&str>>().join(" ")
+                plain_text_result.unwrap_or_default()
             }
             Err(e) => {
                 tracing::warn!("llm_readability failed for {}: {}", url_for_blocking, e);
                 String::new()
             }
         };
+        let intro_text_cleaned = intro_text.split_whitespace().take(200).collect::<Vec<&str>>().join(" ");
+
 
         // --- Construct Representative Text ---
         let representative_text_raw = format!(
@@ -738,11 +775,14 @@ async fn fetch_and_process_page(
             title.as_deref().unwrap_or(""),
             h1.as_deref().unwrap_or(""),
             meta_description.as_deref().unwrap_or(""),
-            intro_text
-        ).trim().to_string(); // Trim potential leading/trailing whitespace
+            intro_text_cleaned // Use the cleaned intro text
+        ).trim().to_string();
 
         // --- Extract domain for cleaning ---
-        let domain_for_cleaning = parsed_url_for_extract.domain().unwrap_or("").to_string();
+        // Ensure domain extraction errors are boxed correctly
+        let domain_for_cleaning = parsed_url_for_extract.domain()
+            .ok_or_else(|| Box::new(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Could not parse domain")) as Box<dyn Error + Send + Sync>)?
+            .to_string();
 
         // --- Clean the representative text ---
         let representative_text = clean_content(&representative_text_raw, &domain_for_cleaning);
@@ -752,13 +792,15 @@ async fn fetch_and_process_page(
 
         // Return extracted components
         Ok::<_, Box<dyn Error + Send + Sync>>((
-            representative_text, // Return the cleaned text
+            representative_text,
             title,
-            h1, // Ensure h1 is returned
-            meta_description, // Ensure meta_description is returned
-            intro_text, // Ensure intro_text is returned
+            h1,
+            meta_description,
+            intro_text_cleaned, // Return the cleaned intro text
         ))
-    }).await??;
+    }).await // This propagates JoinError if the task panics
+       .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)? // Map JoinError -> Box<dyn Error>
+       ?; // This propagates the inner Result (Ok or Box<dyn Error>) from the closure
 
     let (representative_text_str, page_title, page_h1, page_meta_desc, page_intro) = extracted_data;
 
@@ -808,7 +850,7 @@ async fn fetch_and_process_page(
             },
             Err(e) => {
                 tracing::error!("Embedding generation batch failed for {}: {}", original_url_string, e);
-                None
+                None // Propagate embedding failure as None, not an error for the whole function
             }
         }
     } else {
@@ -816,13 +858,14 @@ async fn fetch_and_process_page(
         None
     };
 
+
     // --- Step 5: Create ProcessedPage ---
     Ok(ProcessedPage {
         metadata: PageMetadata {
             url: original_url_string,
             title: page_title,
         },
-        embedding: embedding_option, // This should now be Option<Vec<f32>>
+        embedding: embedding_option,
         h1: page_h1,
         meta_description: page_meta_desc,
         intro_text: page_intro,
@@ -860,9 +903,10 @@ async fn compare_domain_pages(
         request.domain_a, request.domain_b, request.similarity_threshold);
 
     let embedder = state.embedder; // Get the embedder Arc from state
+    let client = state.http_client; // Get the HTTP client Arc from state
 
-    // --- Get Sitemap URLs (remains the same) ---
-    let sitemap_url_a = match find_sitemap(&request.domain_a).await {
+    // --- Get Sitemap URLs (pass client) ---
+    let sitemap_url_a = match find_sitemap(&request.domain_a, client.clone()).await {
         Ok(Some(url)) => url,
         Ok(None) => {
             tracing::error!("Sitemap not found for domain_a: {}", request.domain_a);
@@ -880,7 +924,7 @@ async fn compare_domain_pages(
             return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": format!("Error finding sitemap for domain_a: {}", e)}))).into_response();
         }
     };
-    let sitemap_url_b = match find_sitemap(&request.domain_b).await {
+    let sitemap_url_b = match find_sitemap(&request.domain_b, client.clone()).await {
          Ok(Some(url)) => url,
         Ok(None) => {
             tracing::error!("Sitemap not found for domain_b: {}", request.domain_b);
@@ -898,8 +942,8 @@ async fn compare_domain_pages(
         }
     };
 
-    // --- Get All URLs from Sitemaps (remains the same) ---
-    let urls_a = match get_all_sitemap_urls(&sitemap_url_a).await {
+    // --- Get All URLs from Sitemaps (pass client) ---
+    let urls_a = match get_all_sitemap_urls(&sitemap_url_a, client.clone()).await {
         Ok(urls) => urls,
         Err(e) => {
             tracing::error!("Error getting URLs for domain_a {}: {}", request.domain_a, e);
@@ -907,7 +951,7 @@ async fn compare_domain_pages(
             return (StatusCode::UNPROCESSABLE_ENTITY, Json(serde_json::json!({ "error": format!("Error processing sitemap for domain_a: {}", e)}))).into_response();
         }
     };
-     let urls_b = match get_all_sitemap_urls(&sitemap_url_b).await {
+     let urls_b = match get_all_sitemap_urls(&sitemap_url_b, client.clone()).await {
         Ok(urls) => urls,
          Err(e) => {
             tracing::error!("Error getting URLs for domain_b {}: {}", request.domain_b, e);
@@ -926,20 +970,19 @@ async fn compare_domain_pages(
             })).into_response();
      }
 
-    // --- Fetch and Process Pages Concurrently (Pass embedder) ---
-    let client = Client::new();
+    // --- Fetch and Process Pages Concurrently (Pass embedder and client) ---
     let fetch_process_span_a = tracing::info_span!("fetch_process_embed_pages", domain = %request.domain_a);
     let embedder_a = embedder.clone();
+    let client_a = client.clone(); // Clone client for domain A tasks
     let futures_a = urls_a.into_iter().map(|url| {
-        let client = client.clone();
+        let client_c = client_a.clone(); // Clone client for this specific task
         let embedder_c = embedder_a.clone();
         // Clone url *before* the closure moves the original url
         let url_for_span = url.clone();
         tokio::spawn(async move {
-            // url.clone() inside here clones the *moved* url for the function call
-            (url.clone(), fetch_and_process_page(url, client, embedder_c).await)
+            // Pass the cloned client `client_c`
+            (url.clone(), fetch_and_process_page(url, client_c, embedder_c).await)
         })
-        // Use the clone created *outside* the async block for instrumentation
         .instrument(tracing::info_span!("process_page_task", url = %url_for_span))
     });
     let results_a = join_all(futures_a).instrument(fetch_process_span_a).await;
@@ -947,16 +990,16 @@ async fn compare_domain_pages(
 
     let fetch_process_span_b = tracing::info_span!("fetch_process_embed_pages", domain = %request.domain_b);
     let embedder_b = embedder.clone();
+    let client_b = client.clone(); // Clone client for domain B tasks
     let futures_b = urls_b.into_iter().map(|url| {
-        let client = client.clone();
+        let client_c = client_b.clone(); // Clone client for this specific task
         let embedder_c = embedder_b.clone();
         // Clone url *before* the closure moves the original url
         let url_for_span = url.clone();
         tokio::spawn(async move {
-            // url.clone() inside here clones the *moved* url for the function call
-             (url.clone(), fetch_and_process_page(url, client, embedder_c).await)
+            // Pass the cloned client `client_c`
+             (url.clone(), fetch_and_process_page(url, client_c, embedder_c).await)
         })
-        // Use the clone created *outside* the async block for instrumentation
         .instrument(tracing::info_span!("process_page_task", url = %url_for_span))
     });
     let results_b = join_all(futures_b).instrument(fetch_process_span_b).await;
@@ -1131,16 +1174,20 @@ pub struct CrawlDomainsResponse {
         (status = 422, description = "Invalid request parameters")
     )
 )]
-#[tracing::instrument(skip(request))]
+#[tracing::instrument(skip(request, state))]
 async fn crawl_domains(
+    State(state): State<AppState>, // Inject AppState
     Json(request): Json<CrawlDomainsRequest>
 ) -> impl IntoResponse {
     if request.domains.is_empty() {
         return (StatusCode::UNPROCESSABLE_ENTITY, Json(Vec::<CrawlDomainsResponse>::new())).into_response();
     }
 
+    let client = state.http_client; // Get client from state
+
     let crawl_futures = request.domains.iter().map(|domain| {
-        crawl_single_domain(domain, request.max_pages)
+        // Pass the client to crawl_single_domain
+        crawl_single_domain(domain, request.max_pages, client.clone())
     });
     
     let crawl_span = tracing::info_span!("crawl_all_requested_domains");
@@ -1149,8 +1196,12 @@ async fn crawl_domains(
     (StatusCode::OK, Json(results)).into_response()
 }
 
-#[tracing::instrument(skip(domain), fields(domain = %domain, max_pages = %max_pages))]
-async fn crawl_single_domain(domain: &str, max_pages: usize) -> CrawlDomainsResponse {
+#[tracing::instrument(skip(domain, client), fields(domain = %domain, max_pages = %max_pages))]
+async fn crawl_single_domain(
+    domain: &str,
+    max_pages: usize,
+    client: ClientWithMiddleware // Accept client
+) -> CrawlDomainsResponse {
     let domain_with_protocol = if domain.starts_with("http") {
         domain.to_string()
     } else {
