@@ -766,7 +766,8 @@ async fn fetch_and_process_page(
                 String::new()
             }
         };
-        let intro_text_cleaned = intro_text.split_whitespace().take(200).collect::<Vec<&str>>().join(" ");
+        // Increase the word limit from 200 to 500
+        let intro_text_cleaned = intro_text.split_whitespace().take(500).collect::<Vec<&str>>().join(" ");
 
 
         // --- Construct Representative Text ---
