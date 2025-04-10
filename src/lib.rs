@@ -801,6 +801,9 @@ async fn compare_domain_pages(
     State(state): State<AppState>,
     Json(request): Json<CompareDomainsRequest>
 ) -> impl IntoResponse {
+    // ---> Record start time <---
+    let start_time = Instant::now();
+
     // ---> ADD VALIDATION FOR THRESHOLD <---
     if !(0.0..=1.0).contains(&request.similarity_threshold) {
          return (StatusCode::UNPROCESSABLE_ENTITY, Json(serde_json::json!({
@@ -997,6 +1000,22 @@ async fn compare_domain_pages(
 
     tracing::info!("Found {} similar page pairs above threshold {}", similar_pairs.len(), request.similarity_threshold);
 
+    // ---> Calculate and Log Performance Metrics <---
+    let total_duration = start_time.elapsed();
+    let total_processed_count = processed_a.len() + processed_b.len();
+    let avg_time_per_page = if total_processed_count > 0 {
+        total_duration.as_secs_f64() / total_processed_count as f64
+    } else {
+        0.0 // Avoid division by zero if no pages were processed
+    };
+
+    tracing::info!(
+        total_duration_ms = total_duration.as_millis(),
+        total_pages_processed = total_processed_count,
+        avg_time_per_page_ms = avg_time_per_page * 1000.0, // Convert seconds to milliseconds
+        "Similarity comparison complete."
+    );
+    // -------------------------------------------------
 
     // --- Return Response ---
     (StatusCode::OK, Json(CompareDomainsResponse {
