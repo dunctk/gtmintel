@@ -1218,12 +1218,32 @@ async fn compare_domain_pages(
     }
 
     // Log counts per type (optional but helpful)
+    let mut type_counts_a = String::new();
     for (page_type, pages) in &pages_by_type_a {
-        tracing::debug!("Domain A: Found {} pages of type {:?}", pages.len(), page_type);
+        type_counts_a.push_str(&format!("{:?}: {}, ", page_type, pages.len()));
     }
-     for (page_type, pages) in &pages_by_type_b {
-        tracing::debug!("Domain B: Found {} pages of type {:?}", pages.len(), page_type);
+    if !type_counts_a.is_empty() {
+        // Remove trailing ", "
+        type_counts_a.pop();
+        type_counts_a.pop();
+        tracing::info!("Domain A ({}) page counts by type: {}", request.domain_a, type_counts_a);
+    } else {
+         tracing::info!("Domain A ({}): No pages remaining after filtering.", request.domain_a);
     }
+
+    let mut type_counts_b = String::new();
+    for (page_type, pages) in &pages_by_type_b {
+         type_counts_b.push_str(&format!("{:?}: {}, ", page_type, pages.len()));
+    }
+     if !type_counts_b.is_empty() {
+        // Remove trailing ", "
+        type_counts_b.pop();
+        type_counts_b.pop();
+        tracing::info!("Domain B ({}) page counts by type: {}", request.domain_b, type_counts_b);
+    } else {
+        tracing::info!("Domain B ({}): No pages remaining after filtering.", request.domain_b);
+    }
+    // --- END EDIT ---
 
     drop(_enter_group); // End timing for grouping
 
