@@ -1,8 +1,0 @@
-[target.aarch64-unknown-linux-gnu]
-rustflags = [
-    "-C", "link-arg=-llapack",
-    "-C", "link-arg=-lblas",
-]
-
-[build]
-target = "aarch64-unknown-linux-gnu"
