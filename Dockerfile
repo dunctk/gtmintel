@@ -22,9 +22,12 @@ WORKDIR /app
 
 # Install OpenSSL and LAPACK/BLAS development headers before building
 # Choose one BLAS provider, e.g., OpenBLAS (recommended) or reference LAPACK/BLAS
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    libssl-dev pkg-config \
-    libopenblas-dev # <-- Add this (or liblapack-dev libblas-dev)
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        libssl-dev \
+        pkg-config \
+        libopenblas-dev \
+    # Clean up apt cache after installation
     && rm -rf /var/lib/apt/lists/*
 
 # Copy the recipe from the planner
