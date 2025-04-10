@@ -30,7 +30,7 @@ use tower_governor::{
 };
 #[cfg(not(test))]
 use std::num::NonZeroU32;
-#[cfg(not(test))]
+// Always import Arc as it's needed in both test and non-test builds
 use std::sync::Arc;
 use spider::website::Website;
 use futures::future::join_all;
