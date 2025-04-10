@@ -1991,6 +1991,7 @@ dependencies = [
  "html2text",
  "http-body-util",
  "hyper 1.6.0",
+ "lax 0.17.0",
  "llm_readability",
  "ndarray 0.16.1",
  "once_cell",
@@ -2816,6 +2817,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "lax"
+version = "0.17.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1048f58cdc36e726e1c5ef81ec7ac9b1be2fce6b705786514b5a4f8c63487867"
+dependencies = [
+ "cauchy",
+ "katexit",
+ "lapack-sys",
+ "num-traits",
+ "thiserror 2.0.12",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3282,7 +3296,7 @@ checksum = "0b0e8dda0c941b64a85c5deb2b3e0144aca87aced64678adfc23eacea6d2cc42"
 dependencies = [
  "cauchy",
  "katexit",
- "lax",
+ "lax 0.16.0",
  "ndarray 0.15.6",
  "num-complex 0.4.6",
  "num-traits",
