@@ -20,9 +20,12 @@ RUN cargo chef prepare --recipe-path recipe.json
 FROM chef AS builder
 WORKDIR /app
 
-# Install OpenSSL development headers before building (needed for dynamic linking)
-RUN apt-get update && apt-get install -y --no-install-recommends libssl-dev pkg-config && \
-    rm -rf /var/lib/apt/lists/*
+# Install OpenSSL and LAPACK/BLAS development headers before building
+# Choose one BLAS provider, e.g., OpenBLAS (recommended) or reference LAPACK/BLAS
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libssl-dev pkg-config \
+    libopenblas-dev # <-- Add this (or liblapack-dev libblas-dev)
+    && rm -rf /var/lib/apt/lists/*
 
 # Copy the recipe from the planner
 COPY --from=planner /app/recipe.json recipe.json
