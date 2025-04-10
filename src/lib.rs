@@ -51,6 +51,7 @@ use embed_anything::embeddings::embed::{Embedder, EmbedderBuilder};
 use once_cell::sync::Lazy;
 use html2text;
 use embed_anything::embeddings::embed::EmbeddingResult;
+use regex;
 
 // --- Global Embedder Initialization ---
 // Place this near the top, after imports
@@ -598,6 +599,42 @@ fn cosine_similarity(vec_a: &[f32], vec_b: &[f32]) -> Option<f64> {
 }
 // --- End Helper Function ---
 
+/// Helper function to identify potential boilerplate pages based on URL and title
+fn is_boilerplate_page(page: &ProcessedPage) -> bool {
+    let url_lower = page.metadata.url.to_lowercase();
+    let title_lower = page.metadata.title.as_deref().unwrap_or("").to_lowercase();
+
+    // Keywords to check for in URL path or title
+    let boilerplate_keywords = [
+        "privacy", "policy", "legal", "terms", "condition",
+        "cookie", "disclaimer", "copyright", "accessibility",
+        "imprint", "impressum", // Common in some regions
+        "about-us", "contact", // Sometimes less relevant for semantic comparison
+        // Add more keywords as needed
+    ];
+
+    // Check URL path segments
+    if let Ok(parsed_url) = Url::parse(&page.metadata.url) {
+        if let Some(path_segments) = parsed_url.path_segments() {
+            for segment in path_segments {
+                let segment_lower = segment.to_lowercase();
+                if boilerplate_keywords.iter().any(|&kw| segment_lower.contains(kw)) {
+                    tracing::debug!("Identified boilerplate by URL segment: {}", page.metadata.url);
+                    return true;
+                }
+            }
+        }
+    }
+
+    // Check title
+    if boilerplate_keywords.iter().any(|&kw| title_lower.contains(kw)) {
+        tracing::debug!("Identified boilerplate by title: '{}' in {}", title_lower, page.metadata.url);
+        return true;
+    }
+
+    false // Not identified as boilerplate
+}
+
 #[tracing::instrument(skip(url, client, embedder), fields(url = %url))]
 async fn fetch_and_process_page(
     url: String,
@@ -696,7 +733,7 @@ async fn fetch_and_process_page(
         };
 
         // --- Construct Representative Text ---
-        let representative_text = format!(
+        let representative_text_raw = format!(
             "{} {} {} {}",
             title.as_deref().unwrap_or(""),
             h1.as_deref().unwrap_or(""),
@@ -704,11 +741,18 @@ async fn fetch_and_process_page(
             intro_text
         ).trim().to_string(); // Trim potential leading/trailing whitespace
 
+        // --- Extract domain for cleaning ---
+        let domain_for_cleaning = parsed_url_for_extract.domain().unwrap_or("").to_string();
+
+        // --- Clean the representative text ---
+        let representative_text = clean_content(&representative_text_raw, &domain_for_cleaning);
+
+
         tracing::debug!(url = %url_for_blocking, text_len = representative_text.len(), "Generated representative text");
 
         // Return extracted components
         Ok::<_, Box<dyn Error + Send + Sync>>((
-            representative_text,
+            representative_text, // Return the cleaned text
             title,
             h1, // Ensure h1 is returned
             meta_description, // Ensure meta_description is returned
@@ -720,7 +764,7 @@ async fn fetch_and_process_page(
 
     // --- Step 4 (Outside spawn_blocking): Generate Embedding ---
     let embedding_option: Option<Vec<f32>> = if !representative_text_str.is_empty() {
-        let text_to_embed: [&str; 1] = [&representative_text_str];
+        let text_to_embed: [&str; 1] = [&representative_text_str]; // Use the cleaned text
         let embedding_span = tracing::info_span!("async_embedding", url = %original_url_string);
 
         match embedder.embed(&text_to_embed, None, None).instrument(embedding_span).await {
@@ -926,7 +970,7 @@ async fn compare_domain_pages(
              // Handle JoinError first
              Err(join_error) => tracing::error!("JoinError processing domain_a pages: {}", join_error),
              // Handle Result from fetch_and_process_page
-            Ok((url, Ok(page))) => processed_a.push(page),
+            Ok((_url, Ok(page))) => processed_a.push(page), // Use _url to silence unused warning if url not needed here
             Ok((url, Err(e))) => {
                 tracing::warn!("Failed to process URL for domain_a {}: {}", url, e);
                 errors_a.push(url);
@@ -939,7 +983,7 @@ async fn compare_domain_pages(
      for result in results_b {
         match result {
              Err(join_error) => tracing::error!("JoinError processing domain_b pages: {}", join_error),
-            Ok((url, Ok(page))) => processed_b.push(page),
+            Ok((_url, Ok(page))) => processed_b.push(page), // Use _url
             Ok((url, Err(e))) => {
                 tracing::warn!("Failed to process URL for domain_b {}: {}", url, e);
                 errors_b.push(url);
@@ -947,8 +991,25 @@ async fn compare_domain_pages(
          }
     }
 
-    tracing::info!("Processed {} pages for domain A ({} errors), {} pages for domain B ({} errors)",
-        processed_a.len(), errors_a.len(), processed_b.len(), errors_b.len());
+    let initial_count_a = processed_a.len();
+    let initial_count_b = processed_b.len();
+
+    // --- Filter out boilerplate pages BEFORE comparison ---
+    processed_a.retain(|page| !is_boilerplate_page(page));
+    processed_b.retain(|page| !is_boilerplate_page(page));
+
+    let filtered_count_a = processed_a.len();
+    let filtered_count_b = processed_b.len();
+
+    tracing::info!(
+        "Processed {} pages for domain A ({} errors, {} filtered as boilerplate)",
+        initial_count_a, errors_a.len(), initial_count_a - filtered_count_a
+    );
+    tracing::info!(
+         "Processed {} pages for domain B ({} errors, {} filtered as boilerplate)",
+        initial_count_b, errors_b.len(), initial_count_b - filtered_count_b
+    );
+    // --- End filtering ---
 
     // --- Compare Processed Pages using Embeddings ---
     let mut similar_pairs: Vec<SimilarPagePair> = Vec::new();
@@ -957,6 +1018,7 @@ async fn compare_domain_pages(
         let _enter = comparison_span.enter(); // Time the synchronous comparison loop
         let semantic_threshold = request.similarity_threshold; // Use the threshold from request
 
+        // Use the filtered vectors (processed_a, processed_b) for comparison
         for page_a in &processed_a {
             // Only compare if page_a has an embedding
             if let Some(embed_a) = &page_a.embedding {
@@ -1002,17 +1064,18 @@ async fn compare_domain_pages(
 
     // ---> Calculate and Log Performance Metrics <---
     let total_duration = start_time.elapsed();
-    let total_processed_count = processed_a.len() + processed_b.len();
-    let avg_time_per_page = if total_processed_count > 0 {
-        total_duration.as_secs_f64() / total_processed_count as f64
+    // Use filtered counts for accurate per-page timing of the comparison part
+    let total_compared_count = filtered_count_a + filtered_count_b;
+    let avg_time_per_page = if total_compared_count > 0 { // Use compared count
+        total_duration.as_secs_f64() / total_compared_count as f64
     } else {
-        0.0 // Avoid division by zero if no pages were processed
+        0.0
     };
 
     tracing::info!(
         total_duration_ms = total_duration.as_millis(),
-        total_pages_processed = total_processed_count,
-        avg_time_per_page_ms = avg_time_per_page * 1000.0, // Convert seconds to milliseconds
+        total_pages_compared = total_compared_count, // Log compared count
+        avg_time_per_page_ms = avg_time_per_page * 1000.0,
         "Similarity comparison complete."
     );
     // -------------------------------------------------
@@ -1152,4 +1215,49 @@ async fn crawl_single_domain(domain: &str, max_pages: usize) -> CrawlDomainsResp
         domain: domain.to_string(),
         pages: pages_info, // Use the outer variable - now in scope
     }
+}
+
+// Add a function to clean boilerplate content
+fn clean_content(text: &str, domain: &str) -> String {
+    // Use case-insensitive comparison for phrases
+    let text_lower = text.to_lowercase();
+
+    // --- Normalizing Domain ---
+    // Remove www. prefix if present for broader matching
+    let normalized_domain = domain.trim_start_matches("www.");
+    // Escape dots for regex if needed, but simple replace might be fine for domains
+    let cleaned_domain = text.replace(normalized_domain, "DOMAIN"); // Replace domain
+
+    // Remove common boilerplate phrases (case-insensitive)
+    let common_phrases = vec![
+        "cookie policy", "privacy policy", "terms of service",
+        "all rights reserved", "copyright", "contact us",
+        // Add more potentially noisy common terms found in footers/headers
+        "site map", "accessibility", "careers", "about us" // Example additions
+    ];
+
+    let mut cleaned = cleaned_domain.clone(); // Start with domain-normalized text
+    let cleaned_lower = cleaned_domain.to_lowercase(); // Lowercase version for phrase matching
+
+    for phrase in common_phrases {
+        if cleaned_lower.contains(phrase) {
+            // Use regex for case-insensitive replacement on the original casing string
+             // Create a case-insensitive regex for the phrase
+            match regex::Regex::new(&format!(r"(?i){}", regex::escape(phrase))) {
+                Ok(re) => {
+                    cleaned = re.replace_all(&cleaned, "").to_string();
+                }
+                Err(e) => {
+                    tracing::error!("Invalid regex pattern for phrase '{}': {}", phrase, e);
+                    // Fallback to simple case-sensitive replace if regex fails
+                    cleaned = cleaned.replace(phrase, "");
+                 }
+            }
+        }
+    }
+
+    // Additional cleaning: remove excessive whitespace resulting from replacements
+    cleaned = cleaned.split_whitespace().collect::<Vec<&str>>().join(" ");
+
+    cleaned.trim().to_string()
 } 

@@ -1994,6 +1994,7 @@ dependencies = [
  "llm_readability",
  "ndarray 0.16.1",
  "once_cell",
+ "regex",
  "reqwest 0.11.27",
  "select",
  "serde",
