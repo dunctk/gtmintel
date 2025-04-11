@@ -64,8 +64,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends build-essential
 
 
 # Create and switch to a non-root user (recommended)
-RUN groupadd --system appuser && useradd --system --gid appuser --no-create-home appuser
-USER appuser
+#RUN groupadd --system appuser && useradd --system --gid appuser --no-create-home appuser
+#USER appuser
 
 # Environment
 ENV PORT=3000
