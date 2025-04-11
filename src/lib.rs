@@ -2132,9 +2132,13 @@ async fn analyze_single_domain_for_new_pages(
         let user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36";
         tracing::debug!("Using User-Agent: {}", user_agent);
         
+        // Format date for WP API (YYYY-MM-DD) - the API needs the date in YYYY-MM-DD format
+        let date_str = cutoff_date.format("%Y-%m-%d").to_string();
+        tracing::debug!("Using cutoff date for WordPress API: {}", date_str);
+        
         match client.get(&wp_api_url)
             .header("User-Agent", user_agent)
-            .query(&[("per_page", "10"), ("after", cutoff_date.format("%Y-%m-%dT%H:%M:%S").to_string().as_str())])
+            .query(&[("per_page", "20"), ("after", date_str.as_str())])
             .send()
             .await {
             Ok(res) => {
@@ -2148,28 +2152,39 @@ async fn analyze_single_domain_for_new_pages(
                                 response.detection_method = DetectionMethod::WordPressApi;
                                 response.new_pages_count = posts_array.len() as i32;
                                 
-                                if should_list_pages && response.new_pages_count > 0 {
-                                    for post in posts_array {
-                                        if let (Some(link), Some(date), Some(title)) = (
-                                            post.get("link").and_then(|l| l.as_str()),
-                                            post.get("date").and_then(|d| d.as_str()),
-                                            post.get("title").and_then(|t| t.get("rendered")).and_then(|r| r.as_str())
-                                        ) {
-                                            if let Some(parsed_date) = parse_flexible_date(date) {
-                                                if let Some(urls) = response.new_page_urls.as_mut() {
-                                                    urls.push(link.to_string());
-                                                }
-                                                
-                                                if let Some(details) = response.new_page_details.as_mut() {
-                                                    details.push(NewPageDetail {
-                                                        url: link.to_string(),
-                                                        creation_date: Some(parsed_date.to_rfc3339()),
-                                                        confidence: 0.95,
-                                                        detection_detail: format!("wordpress_api_post: {}", title),
-                                                    });
-                                                }
-                                            }
+                                // Always collect post details from WordPress API, regardless of should_list_pages
+                                // We'll only include them in the response if should_list_pages is true
+                                let mut wp_post_urls = Vec::new();
+                                let mut wp_post_details = Vec::new();
+                                
+                                for post in posts_array {
+                                    if let (Some(link), Some(date), Some(title)) = (
+                                        post.get("link").and_then(|l| l.as_str()),
+                                        post.get("date").and_then(|d| d.as_str()),
+                                        post.get("title").and_then(|t| t.get("rendered")).and_then(|r| r.as_str())
+                                    ) {
+                                        if let Some(parsed_date) = parse_flexible_date(date) {
+                                            tracing::debug!("Found WordPress post: {} ({}) - {}", title, date, link);
+                                            wp_post_urls.push(link.to_string());
+                                            
+                                            wp_post_details.push(NewPageDetail {
+                                                url: link.to_string(),
+                                                creation_date: Some(parsed_date.to_rfc3339()),
+                                                confidence: 0.95,
+                                                detection_detail: format!("wordpress_api_post: {}", title),
+                                            });
                                         }
+                                    }
+                                }
+                                
+                                // Set URLs only if requested
+                                if should_list_pages && !wp_post_urls.is_empty() {
+                                    if let Some(urls) = response.new_page_urls.as_mut() {
+                                        urls.extend(wp_post_urls);
+                                    }
+                                    
+                                    if let Some(details) = response.new_page_details.as_mut() {
+                                        details.extend(wp_post_details);
                                     }
                                 }
                                 // If we found WordPress API, break out of the loop

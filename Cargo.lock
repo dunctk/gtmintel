@@ -2058,6 +2058,7 @@ dependencies = [
  "tower_governor",
  "tracing",
  "tracing-subscriber",
+ "ua_generator",
  "url",
  "utoipa",
  "utoipa-swagger-ui",
