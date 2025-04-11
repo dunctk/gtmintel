@@ -56,14 +56,11 @@ COPY --from=builder /app/target/release/gtmintel /app/gtmintel
 
 # Update package lists and install runtime libs
 # This ensures libssl.so.3 (or similar) and certificates are present
-RUN apt-get update && apt-get install -y --no-install-recommends libssl3 ca-certificates && \
+RUN apt-get update && apt-get install -y --no-install-recommends libssl3 ca-certificates curl && \
     rm -rf /var/lib/apt/lists/*
 
 #RUN apt-get install -y --no-install-recommends build-essential pkg-config libopenblas-dev liblapack-dev && \
 #    rm -rf /var/lib/apt/lists/*
-
-# Required for healthcheck
-RUN apt-get install -y --no-install-recommends curl
 
 
 # Create and switch to a non-root user (recommended)
