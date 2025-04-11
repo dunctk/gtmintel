@@ -56,7 +56,7 @@ COPY --from=builder /app/target/release/gtmintel /app/gtmintel
 
 # Update package lists and install runtime libs
 # This ensures libssl.so.3 (or similar) and certificates are present
-RUN apt-get update && apt-get install -y --no-install-recommends libssl3 ca-certificates curl && \
+RUN apt-get update && apt-get install -y --no-install-recommends libssl3 ca-certificates curl wget && \
     rm -rf /var/lib/apt/lists/*
 
 #RUN apt-get install -y --no-install-recommends build-essential pkg-config libopenblas-dev liblapack-dev && \
