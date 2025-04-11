@@ -2072,14 +2072,26 @@ async fn analyze_single_domain_for_new_pages(
 ) -> Result<NewPagesResponse, AppError> {
     tracing::info!("Starting analysis for single domain: {}", domain);
     
+    // Ensure domain has protocol and no trailing slash
+    let base_url = if !domain.starts_with("http") {
+        format!("https://{}", domain)
+    } else {
+        // Remove potential trailing slash for consistent URL building
+        domain.trim_end_matches('/').to_string()
+    };
+    
     // Find sitemap for this domain
     let sitemap_url = match find_sitemap(&domain, client.clone()).await {
         Ok(Some(url)) => url,
         Ok(None) => {
-            return Err(AppError::SitemapNotFound(domain));
+            tracing::warn!("No sitemap found for domain: {}", domain);
+            // Continue execution, as we'll try other methods
+            String::new()
         },
         Err(e) => {
-            return Err(AppError::SitemapFetchError(e.to_string()));
+            tracing::warn!("Error finding sitemap for {}: {}", domain, e);
+            // Continue execution, as we'll try other methods
+            String::new()
         }
     };
 
@@ -2089,31 +2101,196 @@ async fn analyze_single_domain_for_new_pages(
         new_pages_count: 0,
         days_analyzed: days_to_analyze as u32, // Convert back to u32
         detection_method: DetectionMethod::None,
-        sitemap_url: Some(sitemap_url.clone()),
+        sitemap_url: if sitemap_url.is_empty() { None } else { Some(sitemap_url.clone()) },
         new_page_urls: if should_list_pages { Some(Vec::new()) } else { None },
         new_page_details: if should_list_pages { Some(Vec::new()) } else { None },
         processing_errors: Vec::new(),
     };
     
-    // Get URLs from sitemap
-    let urls_to_check = match get_all_sitemap_urls(&sitemap_url, client.clone()).await {
-        Ok(urls) => {
-            if urls.is_empty() {
-                tracing::warn!("Sitemap found but contained no URLs: {}", sitemap_url);
-                return Ok(response);
-            }
-            urls
-        },
-        Err(e) => {
-            return Err(AppError::ProcessingError(format!("Error extracting URLs from sitemap: {}", e)));
-        }
+    // First, try WordPress API - we'll try both with and without www. prefix
+    let base_url_www = if base_url.contains("://www.") {
+        base_url.clone()
+    } else {
+        base_url.replace("://", "://www.")
     };
     
-    // Rest of the implementation similar to research_new_pages
-    // Process each URL, detect creation dates, filter by cutoff_date, etc.
+    // Create both URLs to try - with and without www
+    let wp_api_urls = vec![
+        format!("{}/wp-json/wp/v2/posts", base_url),
+        format!("{}/wp-json/wp/v2/posts", base_url_www)
+    ];
     
-    // For simplicity, returning the partially filled response
-    // In a real implementation, you would process all the URLs
+    let mut found_wordpress = false;
+    
+    tracing::info!("Trying WordPress API for domain: {}", domain);
+    
+    // Try both URLs
+    for wp_api_url in wp_api_urls {
+        tracing::info!("Trying WordPress API at: {}", wp_api_url);
+        
+        // Try to detect WordPress API with a realistic Chrome user agent
+        let user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36";
+        tracing::debug!("Using User-Agent: {}", user_agent);
+        
+        match client.get(&wp_api_url)
+            .header("User-Agent", user_agent)
+            .query(&[("per_page", "10"), ("after", cutoff_date.format("%Y-%m-%dT%H:%M:%S").to_string().as_str())])
+            .send()
+            .await {
+            Ok(res) => {
+                if res.status().is_success() {
+                    tracing::info!("Found WordPress API at URL: {}", wp_api_url);
+                    match res.json::<serde_json::Value>().await {
+                        Ok(posts) => {
+                            if let Some(posts_array) = posts.as_array() {
+                                tracing::info!("WordPress API returned {} posts for domain: {}", posts_array.len(), domain);
+                                found_wordpress = true;
+                                response.detection_method = DetectionMethod::WordPressApi;
+                                response.new_pages_count = posts_array.len() as i32;
+                                
+                                if should_list_pages && response.new_pages_count > 0 {
+                                    for post in posts_array {
+                                        if let (Some(link), Some(date), Some(title)) = (
+                                            post.get("link").and_then(|l| l.as_str()),
+                                            post.get("date").and_then(|d| d.as_str()),
+                                            post.get("title").and_then(|t| t.get("rendered")).and_then(|r| r.as_str())
+                                        ) {
+                                            if let Some(parsed_date) = parse_flexible_date(date) {
+                                                if let Some(urls) = response.new_page_urls.as_mut() {
+                                                    urls.push(link.to_string());
+                                                }
+                                                
+                                                if let Some(details) = response.new_page_details.as_mut() {
+                                                    details.push(NewPageDetail {
+                                                        url: link.to_string(),
+                                                        creation_date: Some(parsed_date.to_rfc3339()),
+                                                        confidence: 0.95,
+                                                        detection_detail: format!("wordpress_api_post: {}", title),
+                                                    });
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                // If we found WordPress API, break out of the loop
+                                break;
+                            }
+                        },
+                        Err(e) => {
+                            tracing::warn!("Failed to parse WordPress API response for {}: {}", wp_api_url, e);
+                        }
+                    }
+                } else {
+                    tracing::info!("WordPress API not found or returned error for URL {}: {}", wp_api_url, res.status());
+                }
+            },
+            Err(e) => {
+                tracing::info!("Error accessing WordPress API at URL {}: {}", wp_api_url, e);
+            }
+        }
+    }
+    
+    // If WordPress API detection was successful, return early
+    if found_wordpress {
+        tracing::info!("Successfully detected WordPress site for domain: {}", domain);
+        return Ok(response);
+    }
+    
+    // If WordPress detection failed and we have a sitemap, fall back to sitemap analysis
+    if !sitemap_url.is_empty() {
+        // Get URLs from sitemap
+        let urls_to_check = match get_all_sitemap_urls(&sitemap_url, client.clone()).await {
+            Ok(urls) => {
+                if urls.is_empty() {
+                    tracing::warn!("Sitemap found but contained no URLs: {}", sitemap_url);
+                    return Ok(response);
+                }
+                
+                tracing::info!("Processing {} URLs from sitemap for domain: {}", urls.len(), domain);
+                urls
+            },
+            Err(e) => {
+                tracing::error!("Error extracting URLs from sitemap for {}: {}", domain, e);
+                response.processing_errors.push(format!("Failed to extract URLs from sitemap: {}", e));
+                return Ok(response);
+            }
+        };
+        
+        // Process each URL to detect creation dates
+        let mut detection_tasks = Vec::new();
+        let mut found_valid_date = false;
+        
+        // Create detection tasks for each URL
+        for url in urls_to_check {
+            let client_clone = client.clone();
+            detection_tasks.push(tokio::spawn(async move {
+                (url.clone(), detect_creation_date(url.clone(), client_clone).await)
+            }));
+        }
+        
+        // Wait for all tasks to complete
+        let detection_results = join_all(detection_tasks).await;
+        
+        // Process results
+        for result in detection_results {
+            match result {
+                Ok((url, Ok(Some(detail)))) => {
+                    // If we found a date for this URL
+                    if let Some(creation_date_str) = &detail.creation_date {
+                        match chrono::DateTime::parse_from_rfc3339(creation_date_str) {
+                            Ok(parsed_date) => {
+                                found_valid_date = true;
+                                let creation_date_utc = parsed_date.with_timezone(&Utc);
+                                
+                                // Check if the date is within the desired range
+                                if creation_date_utc >= cutoff_date {
+                                    tracing::debug!("New page detected for {}: {} (Date: {}, Method: {})", 
+                                        domain, detail.url, creation_date_str, detail.detection_detail);
+                                    response.new_pages_count += 1;
+                                    
+                                    if should_list_pages {
+                                        if let Some(urls) = response.new_page_urls.as_mut() {
+                                            urls.push(detail.url.clone());
+                                        }
+                                        if let Some(details) = response.new_page_details.as_mut() {
+                                            details.push(detail);
+                                        }
+                                    }
+                                } else {
+                                    tracing::trace!("Page date {} is outside cutoff {} for {}", 
+                                        creation_date_utc.to_rfc3339(), cutoff_date.to_rfc3339(), url);
+                                }
+                            },
+                            Err(e) => {
+                                tracing::error!("Failed to parse date string '{}' for {}: {}", 
+                                    creation_date_str, url, e);
+                                response.processing_errors.push(url);
+                            }
+                        }
+                    }
+                },
+                Ok((url, Ok(None))) => {
+                    tracing::trace!("No date information found in HTML for {}", url);
+                    found_valid_date = true; // Mark that we attempted HTML analysis
+                },
+                Ok((url, Err(e))) => {
+                    tracing::warn!("Failed to process URL for date detection {}: {}", url, e);
+                    response.processing_errors.push(url);
+                },
+                Err(e) => {
+                    tracing::error!("Task join error: {}", e);
+                    // Can't add URL to errors as we don't have it here
+                }
+            }
+        }
+        
+        // Set detection method if we used HTML analysis
+        if found_valid_date {
+            response.detection_method = DetectionMethod::HtmlAnalysis;
+        }
+    }
+    
+    // Return the response, which might just have basic info if no detection methods worked
     Ok(response)
 }
 // --- END EDIT ---
