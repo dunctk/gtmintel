@@ -393,7 +393,7 @@ async fn health_check() -> impl IntoResponse {
         health_check,
         crawl_domains,
         compare_domain_pages,
-        research_new_pages
+        research_new_pages_batch
     ),
     components(schemas(
         ResearchQuery, 
@@ -435,7 +435,7 @@ pub fn create_app() -> Router {
         .route("/health", get(health_check))
         .route("/research/crawl", post(crawl_domains))
         .route("/research/similar-pages", post(compare_domain_pages))
-        .route("/research/pages/new", get(research_new_pages))
+        .route("/research/pages/new/batch", post(research_new_pages_batch))
         .with_state(app_state.clone()); // Pass state to API routes
         
     // --- Conditionally apply layers and Swagger UI only when NOT running tests ---
@@ -1722,20 +1722,22 @@ fn default_within_days_new() -> u32 {
     30 // Default to checking the last 30 days for new pages
 }
 
-#[derive(Debug, Deserialize, ToSchema, IntoParams)]
-#[into_params(parameter_in = Query)]
+// --- EDIT: Modify NewPagesQuery to accept multiple domains and remove param attributes ---
+#[derive(Debug, Deserialize, ToSchema)] // Remove IntoParams
 pub struct NewPagesQuery {
-    /// Domain name to analyze
-    domain: String,
-    /// Optional: Set to true to include the list of new page URLs and details in the response. Defaults to false.
+    /// List of domain names to analyze (max 20)
+    domains: Vec<String>,
+    /// Optional: Set to true to include the list of new page URLs and details in the response for each domain. Defaults to false.
     #[serde(default)]
-    #[param(required = false)]
+    // #[param(required = false)] // <-- Remove this line
     list_pages: Option<bool>,
     /// Optional: Number of days in the past to check for newly created pages. Defaults to 30.
     #[serde(default = "default_within_days_new")]
-    #[param(required = false)]
+    // #[param(required = false)] // <-- Remove this line
     within_days: u32,
 }
+// --- END EDIT ---
+
 
 #[derive(Debug, Serialize, ToSchema, Clone)]
 pub struct NewPageDetail {
@@ -1778,192 +1780,246 @@ pub struct NewPagesResponse {
     new_page_details: Option<Vec<NewPageDetail>>,
     /// URLs from the sitemap that failed during processing (e.g., fetching, date extraction)
     processing_errors: Vec<String>,
+    /// Status of the analysis for this specific domain
+    status: String, // e.g., "Success", "SitemapNotFound", "ProcessingError"
 }
 
-/// Get newly created pages within a specified number of days for a given domain
+/// Get newly created pages within a specified number of days for multiple domains
 #[utoipa::path(
-    get,
-    path = "/research/pages/new",
-    params(NewPagesQuery),
+    post, // Changed to POST
+    path = "/research/pages/new/batch", // Changed path
+    request_body = NewPagesQuery,
     responses(
-        (status = 200, description = "Success, analysis complete", body = NewPagesResponse),
-        (status = 422, description = "Unprocessable Entity - Sitemap not found or processing error", body = NewPagesResponse),
-        (status = 500, description = "Internal Server Error during processing")
+        (status = 200, description = "Success, analysis complete for all requested domains", body = Vec<NewPagesResponse>), // Response is Vec
+        (status = 422, description = "Unprocessable Entity - Invalid input (e.g., too many domains)", body = String),
+        (status = 500, description = "Internal Server Error during processing for one or more domains")
     ),
-    description = "Attempts to identify web pages created within a specific number of days by analyzing sitemaps, HTML metadata, and potentially CMS APIs."
+    description = "Attempts to identify web pages created within a specific number of days for multiple domains by analyzing sitemaps and HTML metadata."
 )]
-#[tracing::instrument(skip(query, state), fields(domain = %query.domain, days = %query.within_days))]
-async fn research_new_pages(
-    Query(query): Query<NewPagesQuery>,
-    State(state): State<AppState> // Inject AppState
+#[tracing::instrument(skip(query, state), fields(domains_count = query.domains.len(), days = %query.within_days))]
+async fn research_new_pages_batch( // This is the active handler
+    State(state): State<AppState>,
+    Json(query): Json<NewPagesQuery>
 ) -> impl IntoResponse {
     let start_time = Instant::now();
+    const MAX_DOMAINS: usize = 20;
+
+    // --- EDIT: Add domain limit check ---
+    if query.domains.is_empty() {
+        return (StatusCode::UNPROCESSABLE_ENTITY, Json(serde_json::json!({"error": "Domain list cannot be empty."}))).into_response();
+    }
+    if query.domains.len() > MAX_DOMAINS {
+         return (StatusCode::UNPROCESSABLE_ENTITY, Json(serde_json::json!({
+             "error": format!("Maximum number of domains allowed is {}", MAX_DOMAINS)
+         }))).into_response();
+    }
+    // --- END EDIT ---
+
+    let client = state.http_client.clone();
     let days_to_analyze = query.within_days;
-    // Calculate the cutoff date (inclusive)
-    let cutoff_date = Utc::now() - Duration::days(days_to_analyze as i64);
     let should_list_pages = query.list_pages.unwrap_or(false);
 
+    // --- EDIT: Process domains concurrently ---
+    let analysis_futures = query.domains.into_iter().map(|domain| {
+        let client_clone = client.clone();
+        // Clone necessary params for the async block
+        tokio::spawn(async move {
+             analyze_single_domain_for_new_pages(domain, days_to_analyze, should_list_pages, client_clone).await
+        })
+    });
+
+    let batch_span = tracing::info_span!("analyze_domain_batch");
+    let results: Vec<Result<NewPagesResponse, tokio::task::JoinError>> = join_all(analysis_futures)
+        .instrument(batch_span)
+        .await;
+    // --- END EDIT ---
+
+    // --- EDIT: Collect results, handling potential JoinErrors ---
+    let mut final_responses: Vec<NewPagesResponse> = Vec::new();
+    for result in results {
+        match result {
+            Ok(response) => final_responses.push(response),
+            Err(e) => {
+                // Handle task panic - log and potentially add a generic error response
+                tracing::error!("Task panicked during domain analysis: {}", e);
+                // We might not know which domain panicked here easily without more complex tracking.
+                // For now, we just log it. The successful ones will still be included.
+                // Alternatively, create a generic error response if needed.
+            }
+        }
+    }
+    // --- END EDIT ---
+
+    let duration = start_time.elapsed();
+    tracing::info!(
+        total_domains_processed = final_responses.len(),
+        duration_ms = duration.as_millis(),
+        "Batch new page analysis complete."
+    );
+
+    // --- EDIT: Return the Vec of responses ---
+    (StatusCode::OK, Json(final_responses)).into_response()
+    // --- END EDIT ---
+}
+
+
+// --- EDIT: Extract core logic into a helper function for a single domain ---
+#[tracing::instrument(skip(client), fields(domain = %domain, days = %days_to_analyze))]
+async fn analyze_single_domain_for_new_pages(
+    domain: String,
+    days_to_analyze: u32,
+    should_list_pages: bool,
+    client: ClientWithMiddleware,
+) -> NewPagesResponse {
+    let start_time = Instant::now();
+    let cutoff_date = Utc::now() - Duration::days(days_to_analyze as i64);
+
     tracing::info!("Starting new page analysis for {} within {} days (cutoff: {})",
-        query.domain, days_to_analyze, cutoff_date.to_rfc3339());
+        domain, days_to_analyze, cutoff_date.to_rfc3339());
 
-    let client = state.http_client.clone(); // Use client from state
-
-    // --- Initialize Response ---
-    // Renamed field to be more descriptive
+    // Initialize response body for this domain
     let mut response_body = NewPagesResponse {
-        domain: query.domain.clone(),
-        new_pages_count: 0, // Initialize count
+        domain: domain.clone(),
+        new_pages_count: 0,
         days_analyzed: days_to_analyze,
-        detection_method: DetectionMethod::None, // Start with None
+        detection_method: DetectionMethod::None,
         sitemap_url: None,
         new_page_urls: if should_list_pages { Some(Vec::new()) } else { None },
         new_page_details: if should_list_pages { Some(Vec::new()) } else { None },
         processing_errors: Vec::new(),
+        status: "Processing".to_string(), // Initial status
     };
 
     // --- 1. Find Sitemap ---
-    let sitemap_url_result = find_sitemap(&query.domain, client.clone()).await;
-    // ... (existing sitemap finding logic remains the same) ...
-     let sitemap_url = match sitemap_url_result {
+    let sitemap_url_result = find_sitemap(&domain, client.clone()).await;
+    let sitemap_url = match sitemap_url_result {
         Ok(Some(url)) => {
             response_body.sitemap_url = Some(url.clone());
             tracing::info!("Found sitemap: {}", url);
             url
         },
         Ok(None) => {
-            tracing::warn!("Sitemap not found for {}", query.domain);
+            tracing::warn!("Sitemap not found for {}", domain);
             response_body.processing_errors.push("Sitemap not found".to_string());
-            return (StatusCode::UNPROCESSABLE_ENTITY, Json(response_body)).into_response();
+            response_body.status = "SitemapNotFound".to_string();
+            return response_body; // Return early if sitemap not found
         },
         Err(e) => {
-            tracing::error!("Error finding sitemap for {}: {}", query.domain, e);
+            tracing::error!("Error finding sitemap for {}: {}", domain, e);
             response_body.processing_errors.push(format!("Error finding sitemap: {}", e));
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(response_body)).into_response();
+             response_body.status = "SitemapError".to_string();
+             return response_body; // Return early on error
         }
     };
 
-
     // --- 2. Get All URLs from Sitemap ---
     let all_urls_result = get_all_sitemap_urls(&sitemap_url, client.clone()).await;
-    // ... (existing URL extraction logic remains the same) ...
-     let urls_to_check = match all_urls_result {
+    let urls_to_check = match all_urls_result {
         Ok(urls) => {
             if urls.is_empty() {
                 tracing::warn!("Sitemap found but contained no URLs: {}", sitemap_url);
-                 return (StatusCode::OK, Json(response_body)).into_response();
+                 response_body.status = "Success".to_string(); // Technically success, just no pages to check
+                 return response_body;
             }
-            tracing::info!("Found {} URLs in sitemap(s) to analyze", urls.len());
+            tracing::info!("Found {} URLs in sitemap(s) to analyze for {}", urls.len(), domain);
             urls
         },
         Err(e) => {
             tracing::error!("Error extracting URLs from sitemap {}: {}", sitemap_url, e);
             response_body.processing_errors.push(format!("Error reading sitemap: {}", e));
-            return (StatusCode::UNPROCESSABLE_ENTITY, Json(response_body)).into_response();
+            response_body.status = "SitemapReadError".to_string();
+            return response_body; // Return early on error
         }
     };
 
+    // --- EDIT: Get length *before* moving the vector ---
+    let num_urls_to_check = urls_to_check.len();
+    // --- END EDIT ---
 
     // --- 3. Process URLs Concurrently ---
+    // Now move urls_to_check using into_iter
     let detection_futures = urls_to_check.into_iter().map(|url| {
         let client_clone = client.clone();
-        let url_clone = url.clone(); // Clone URL for the async block
+        let url_clone = url.clone();
         tokio::spawn(async move {
             (url_clone, detect_creation_date(url, client_clone).await)
         })
     });
 
-    let detection_span = tracing::info_span!("detect_creation_dates", url_count = detection_futures.len());
+    let detection_span = tracing::info_span!("detect_creation_dates", url_count = detection_futures.len(), domain = %domain);
     let detection_results = join_all(detection_futures).instrument(detection_span).await;
 
     // --- 4. Collect Results and Filter ---
-    let mut found_valid_date = false; // Track if any date was successfully detected and parsed
-
+    let mut found_valid_date = false;
     for result in detection_results {
         match result {
             Err(join_error) => {
-                // Log join errors (panics in spawned tasks)
-                tracing::error!("JoinError during date detection: {}", join_error);
-                // Optionally add a generic error or try to extract URL if possible
-                response_body.processing_errors.push("Task panic during processing".to_string());
+                tracing::error!("JoinError during date detection for {}: {}", domain, join_error);
+                response_body.processing_errors.push(format!("Task panic during processing for domain {}", domain));
             }
             Ok((url, Ok(Some(detail)))) => {
-                // Successfully fetched and found a date
                 if let Some(creation_date_str) = &detail.creation_date {
-                    // Attempt to parse the date string back to DateTime<Utc>
-                     match DateTime::parse_from_rfc3339(creation_date_str) {
+                    match DateTime::parse_from_rfc3339(creation_date_str) {
                         Ok(parsed_date) => {
-                             found_valid_date = true; // Mark that we used HTML analysis
+                            found_valid_date = true;
                             let creation_date_utc = parsed_date.with_timezone(&Utc);
-
-                            // Check if the date is within the desired range (inclusive)
                             if creation_date_utc >= cutoff_date {
-                                tracing::debug!("New page detected: {} (Date: {}, Method: {}, Confidence: {:.2})",
-                                    detail.url, creation_date_utc.to_rfc3339(), detail.detection_detail, detail.confidence);
+                                tracing::debug!("New page detected for {}: {} (Date: {}, Method: {}, Confidence: {:.2})",
+                                    domain, detail.url, creation_date_utc.to_rfc3339(), detail.detection_detail, detail.confidence);
                                 response_body.new_pages_count += 1;
                                 if should_list_pages {
-                                    // Add to lists only if requested
-                                     if let Some(urls) = response_body.new_page_urls.as_mut() {
-                                         urls.push(detail.url.clone());
-                                     }
-                                    if let Some(details) = response_body.new_page_details.as_mut() {
-                                         details.push(detail);
-                                     }
+                                    if let Some(urls) = response_body.new_page_urls.as_mut() { urls.push(detail.url.clone()); }
+                                    if let Some(details) = response_body.new_page_details.as_mut() { details.push(detail); }
                                 }
                             } else {
-                                 tracing::trace!("Page date {} is outside the cutoff {} for {}", creation_date_utc.to_rfc3339(), cutoff_date.to_rfc3339(), url);
+                                tracing::trace!("Page date {} is outside cutoff {} for {} on domain {}", creation_date_utc.to_rfc3339(), cutoff_date.to_rfc3339(), url, domain);
                             }
                         }
                         Err(parse_err) => {
-                            // Log if the date string from NewPageDetail couldn't be parsed back
-                            tracing::error!("Failed to parse stored date string '{}' for {}: {}", creation_date_str, url, parse_err);
-                             response_body.processing_errors.push(url); // Add URL to errors if date parsing failed
+                            tracing::error!("Failed to parse stored date string '{}' for {} on domain {}: {}", creation_date_str, url, domain, parse_err);
+                            response_body.processing_errors.push(url);
                         }
                     }
                 } else {
-                    // Should not happen if detail is Some, but handle defensively
-                     tracing::warn!("NewPageDetail present but creation_date is None for {}", url);
-                    // Don't count as an error unless needed
+                    tracing::warn!("NewPageDetail present but creation_date is None for {} on domain {}", url, domain);
                 }
             }
             Ok((url, Ok(None))) => {
-                // Successfully fetched, but no date found in HTML
-                 tracing::trace!("No date information found in HTML for {}", url);
-                 found_valid_date = true; // Mark that we used HTML analysis, even if no date was found for *this* page
+                tracing::trace!("No date information found in HTML for {} on domain {}", url, domain);
+                 found_valid_date = true; // Mark that we attempted HTML analysis
             }
             Ok((url, Err(e))) => {
-                // Error fetching or processing the specific URL
-                tracing::warn!("Failed to process URL for date detection {}: {}", url, e);
+                tracing::warn!("Failed to process URL for date detection {} on domain {}: {}", url, domain, e);
                 response_body.processing_errors.push(url);
             }
         }
     }
 
-     // --- 5. Set Final Detection Method ---
-     if found_valid_date {
-         // We successfully attempted HTML analysis on at least one page
-         response_body.detection_method = DetectionMethod::HtmlAnalysis;
-         // TODO: In the future, if we add WordPress API checks or Sitemap lastmod checks,
-         // this logic would need to be updated to potentially set Mixed or WordPressApi, etc.
-     } else if response_body.sitemap_url.is_some() && response_body.processing_errors.is_empty() {
-          // If we only had a sitemap and no URLs could be processed for dates (e.g., all failed fetch)
-          // Or if get_all_sitemap_urls returned Ok but empty vec initially (handled earlier)
-          // Keep as None or potentially add a SitemapOnly status if needed
-          tracing::debug!("Analysis completed, but no date information could be extracted via HTML.");
+    // --- 5. Set Final Detection Method and Status ---
+    if found_valid_date {
+        response_body.detection_method = DetectionMethod::HtmlAnalysis;
+    }
+     if response_body.processing_errors.is_empty() && response_body.status == "Processing" {
+         response_body.status = "Success".to_string();
+     } else if !response_body.processing_errors.is_empty() && response_body.status == "Processing" {
+        response_body.status = "PartialSuccess".to_string(); // Success, but some URLs failed
      }
-     // If errors occurred but no dates found, method remains None or reflects partial success if any page worked.
+     // Status might have already been set to an error state earlier
 
     // --- Finalize and Return ---
-    // ... (existing logging and return logic) ...
     let duration = start_time.elapsed();
-    tracing::info!(
-        domain = %query.domain,
-        new_pages_found = response_body.new_pages_count, // Renamed log field
-        pages_analyzed = response_body.new_page_details.as_ref().map_or(0, |d| d.len()) + response_body.processing_errors.len(), // Approximate count
+     tracing::info!(
+        domain = %domain, // Keep domain in log context
+        new_pages_found = response_body.new_pages_count,
+        // --- EDIT: Use the stored length ---
+        pages_analyzed = num_urls_to_check, // Use the variable calculated earlier
+        // --- END EDIT ---
         errors = response_body.processing_errors.len(),
         duration_ms = duration.as_millis(),
-        detection_method = ?response_body.detection_method, // Log the method used
-        "New page analysis complete."
+        detection_method = ?response_body.detection_method,
+        status = %response_body.status,
+        "Single domain new page analysis complete."
     );
-
-    (StatusCode::OK, Json(response_body)).into_response()
-} 
+    response_body // Return the populated response for this domain
+}
+// --- END EDIT --- 
