@@ -35,7 +35,8 @@ use std::sync::Arc;
 use spider::website::Website;
 use futures::future::join_all;
 use select::document::Document;
-use select::predicate::{Name, Attr};
+use select::predicate::{Name, Attr, Predicate};
+use select::node::Node;
 use llm_readability::extractor;
 use reqwest::Client;
 use url::Url;
@@ -57,6 +58,11 @@ use reqwest_middleware::ClientWithMiddleware;
 use http_cache_reqwest::{Cache, CacheMode, CACacheManager, HttpCache, HttpCacheOptions};
 use reqwest_middleware::ClientBuilder;
 // --- End HTTP Cache Imports ---
+use chrono::{DateTime, FixedOffset}; // Add FixedOffset for parsing
+use regex::Regex; // Already imported, ensure it's available
+
+// --- Add TimeZone trait to scope ---
+use chrono::TimeZone;
 
 // --- Global Embedder Initialization ---
 // Place this near the top, after imports
@@ -386,7 +392,8 @@ async fn health_check() -> impl IntoResponse {
         research_pages,
         health_check,
         crawl_domains,
-        compare_domain_pages
+        compare_domain_pages,
+        research_new_pages
     ),
     components(schemas(
         ResearchQuery, 
@@ -397,7 +404,11 @@ async fn health_check() -> impl IntoResponse {
         CompareDomainsRequest,
         CompareDomainsResponse,
         SimilarPagePair,
-        PageMetadata
+        PageMetadata,
+        NewPagesQuery,
+        NewPagesResponse,
+        NewPageDetail,
+        DetectionMethod
     ))
 )]
 struct ApiDoc;
@@ -424,6 +435,7 @@ pub fn create_app() -> Router {
         .route("/health", get(health_check))
         .route("/research/crawl", post(crawl_domains))
         .route("/research/similar-pages", post(compare_domain_pages))
+        .route("/research/pages/new", get(research_new_pages))
         .with_state(app_state.clone()); // Pass state to API routes
         
     // --- Conditionally apply layers and Swagger UI only when NOT running tests ---
@@ -845,6 +857,212 @@ async fn get_all_sitemap_urls(
     Ok(all_page_urls)
 }
 // --- End sitemap URL extractor ---
+
+// --- Add helper function to parse date strings ---
+// Use Lazy static for regex compilation
+static DATE_PATTERN_REGEX: Lazy<Regex> = Lazy::new(|| {
+    // Regex to find common date patterns like "Published on: Jan 1, 2023", "Posted: 2023-01-15", etc.
+    // This is a basic example and might need significant refinement for robustness.
+    // It captures potential date strings following keywords.
+    Regex::new(r"(?i)(?:published|posted|created)(?:\s*on)?[:\s]+([a-zA-Z]+\s+\d{1,2},\s*\d{4}|\d{4}-\d{2}-\d{2}|\d{1,2}\s+[a-zA-Z]+\s+\d{4})")
+        .expect("Failed to compile date pattern regex")
+});
+
+// More flexible parsing attempts using common formats
+fn parse_flexible_date(date_str: &str) -> Option<DateTime<Utc>> {
+    // Trim whitespace
+    let date_str = date_str.trim();
+
+    // Try common formats supported by chrono directly
+    // Order matters: try more specific formats first
+    let formats = [
+        "%Y-%m-%dT%H:%M:%S%.fZ", // ISO 8601 with Zulu offset
+        "%Y-%m-%dT%H:%M:%S%:z",  // ISO 8601 with timezone offset
+        "%Y-%m-%d %H:%M:%S %z",
+        "%a, %d %b %Y %H:%M:%S %z", // RFC 2822 style
+        "%Y-%m-%d",             // Date only
+        "%b %d, %Y",            // "Jan 1, 2023"
+        "%d %b %Y",             // "1 Jan 2023"
+        "%B %d, %Y",            // "January 1, 2023"
+        "%d %B %Y",             // "1 January 2023"
+
+    ];
+
+    for fmt in formats.iter() {
+         // --- Attempt 1: Parse as DateTime<Utc> directly ---
+        if let Ok(dt_utc) = DateTime::parse_from_str(date_str, fmt).map(|dt| dt.with_timezone(&Utc)) {
+            return Some(dt_utc);
+        }
+         // --- Attempt 2: Parse as DateTime<FixedOffset> then convert ---
+        if let Ok(dt_fixed) = DateTime::parse_from_str(date_str, fmt) {
+             // Check if it parsed successfully, then convert to UTC
+            return Some(dt_fixed.with_timezone(&Utc));
+         }
+         // --- Attempt 3: Parse as NaiveDateTime then assume UTC ---
+         // Be cautious with this, only use if timezone is highly likely UTC or unknown
+         if let Ok(naive_dt) = chrono::NaiveDateTime::parse_from_str(date_str, fmt) {
+             // Explicitly create DateTime<Utc>
+             if let chrono::LocalResult::Single(dt_utc) = Utc.from_local_datetime(&naive_dt) {
+                 return Some(dt_utc);
+             }
+         }
+         // --- Attempt 4: Parse as NaiveDate then assume start of day UTC ---
+         if let Ok(naive_date) = chrono::NaiveDate::parse_from_str(date_str, fmt) {
+            if let Some(dt_utc) = naive_date.and_hms_opt(0, 0, 0).map(|ndt| Utc.from_utc_datetime(&ndt)) {
+                return Some(dt_utc);
+            }
+         }
+    }
+
+    // Fallback: Try dateparser crate if chrono fails (optional dependency)
+    // if let Ok(parsed_dt) = dateparser::parse(date_str) {
+    //     return Some(parsed_dt.with_timezone(&Utc));
+    // }
+
+    tracing::trace!("Could not parse date string '{}' with known formats", date_str);
+    None
+}
+// --- End date parsing helper ---
+
+
+#[tracing::instrument(skip(url, client), fields(url = %url))]
+async fn detect_creation_date(
+    url: String,
+    client: ClientWithMiddleware, // Accept the cached client
+) -> Result<Option<NewPageDetail>, Box<dyn Error + Send + Sync>> {
+    tracing::debug!("Fetching for date detection: {}", url);
+
+    // --- Fetch page content ---
+    // ... (fetch logic remains the same) ...
+    let response = match client.get(&url).send().await {
+        Ok(resp) => {
+            if resp.status().is_success() {
+                resp
+            } else {
+                return Err(format!("HTTP status {} for {}", resp.status(), url).into());
+            }
+        }
+        Err(e) => {
+             return Err(format!("Failed to fetch {}: {}", url, e).into());
+        }
+    };
+
+    let html_content = response.text().await.map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
+
+    // --- Parse HTML ---
+    let document = Document::from(html_content.as_str());
+
+    // --- Strategy 1: Meta Tags (Revised - No Vec<Box<dyn Predicate>>) ---
+    // Check each meta tag predicate individually
+    let checks = [
+        (Name("meta").and(Attr("property", "article:published_time")), 0.9, "meta_published_time"),
+        (Name("meta").and(Attr("property", "og:published_time")), 0.85, "meta_og_published_time"),
+        (Name("meta").and(Attr("name", "pubdate")), 0.8, "meta_pubdate"),
+        (Name("meta").and(Attr("name", "date")), 0.7, "meta_date"),
+        (Name("meta").and(Attr("itemprop", "datePublished")), 0.9, "meta_itemprop_datePublished"),
+    ];
+
+    for (predicate, confidence, detail_key) in checks.iter() {
+        // --- EDIT: Pass the concrete predicate type `predicate` directly ---
+        // Note: `predicate` here is `&And<Name<...>, Attr<...>>` due to iter()
+        // We pass `*predicate` to satisfy the `P: Predicate` bound by value (using the Copy impl of the predicate structs)
+        if let Some(node) = document.find(*predicate).next() {
+            if let Some(content) = node.attr("content") {
+                if let Some(parsed_date) = parse_flexible_date(content) {
+                    tracing::debug!("Found date via {}: {} ({})", detail_key, content, url);
+                    return Ok(Some(NewPageDetail {
+                        url: url.clone(),
+                        creation_date: Some(parsed_date.to_rfc3339()),
+                        confidence: *confidence,
+                        detection_detail: detail_key.to_string(),
+                    }));
+                } else {
+                    tracing::trace!("Failed to parse date from {}: {}", detail_key, content);
+                }
+            }
+        }
+        // --- END EDIT ---
+    }
+    // --- End Strategy 1 Revision ---
+
+    // --- Strategy 2: JSON-LD Structured Data ---
+    // (This was already using a concrete predicate type, should be fine)
+    let json_ld_predicate = Name("script").and(Attr("type", "application/ld+json"));
+    for script_node in document.find(json_ld_predicate) {
+        // ... (rest of JSON-LD logic) ...
+        let script_content = script_node.inner_html();
+        if let Ok(json_data) = serde_json::from_str::<serde_json::Value>(&script_content) {
+            let potential_date_str = json_data.get("datePublished")
+                .or_else(|| json_data.get("uploadDate"))
+                .and_then(|v| v.as_str());
+
+            if let Some(date_str) = potential_date_str {
+                if let Some(parsed_date) = parse_flexible_date(date_str) {
+                    tracing::debug!("Found date via JSON-LD: {} ({})", date_str, url);
+                    return Ok(Some(NewPageDetail {
+                        url: url.clone(),
+                        creation_date: Some(parsed_date.to_rfc3339()),
+                        confidence: 0.95,
+                        detection_detail: "json_ld_date_published".to_string(),
+                    }));
+                } else {
+                    tracing::trace!("Failed to parse date from JSON-LD: {}", date_str);
+                }
+            }
+        }
+    }
+
+
+    // --- Strategy 3: <time> Tag ---
+    // (This was already using a concrete predicate type, should be fine)
+    let time_predicate = Name("time").and(Attr("datetime", ())); // Check for presence of datetime attr
+    if let Some(time_node) = document.find(time_predicate).next() {
+        // ... (rest of time tag logic) ...
+        if let Some(datetime_attr) = time_node.attr("datetime") {
+            if let Some(parsed_date) = parse_flexible_date(datetime_attr) {
+                tracing::debug!("Found date via <time datetime>: {} ({})", datetime_attr, url);
+                return Ok(Some(NewPageDetail {
+                    url: url.clone(),
+                    creation_date: Some(parsed_date.to_rfc3339()),
+                    confidence: 0.75,
+                    detection_detail: "time_datetime".to_string(),
+                }));
+            } else {
+                tracing::trace!("Failed to parse date from <time datetime>: {}", datetime_attr);
+            }
+        }
+    }
+
+
+    // --- Strategy 4: Text Patterns (Lower Confidence) ---
+    // (This uses Name directly, fine)
+    let body_text = document.find(Name("body")).next().map(|n| n.text()).unwrap_or_default();
+    // ... (rest of text pattern logic) ...
+    if let Some(captures) = DATE_PATTERN_REGEX.captures(&body_text) {
+        if let Some(date_match) = captures.get(1) {
+            let date_str = date_match.as_str();
+            if let Some(parsed_date) = parse_flexible_date(date_str) {
+                tracing::debug!("Found date via text pattern: {} ({})", date_str, url);
+                return Ok(Some(NewPageDetail {
+                    url: url.clone(),
+                    creation_date: Some(parsed_date.to_rfc3339()),
+                    confidence: 0.4,
+                    detection_detail: "text_pattern".to_string(),
+                }));
+            } else {
+                tracing::trace!("Failed to parse date from text pattern: {}", date_str);
+            }
+        }
+    }
+
+
+    // --- No Date Found ---
+    tracing::debug!("No creation date found in HTML for: {}", url);
+    Ok(None)
+}
+
+// --- End detect_creation_date ---
+
 
 #[tracing::instrument(skip(url, client, embedder), fields(url = %url))]
 async fn fetch_and_process_page(
@@ -1495,4 +1713,257 @@ fn clean_content(text: &str, domain: &str) -> String {
     cleaned = cleaned.split_whitespace().collect::<Vec<&str>>().join(" ");
 
     cleaned.trim().to_string()
+}
+
+// --- Structs and Enums for New Pages Endpoint ---
+
+// Function to provide the default value for within_days in NewPagesQuery
+fn default_within_days_new() -> u32 {
+    30 // Default to checking the last 30 days for new pages
+}
+
+#[derive(Debug, Deserialize, ToSchema, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct NewPagesQuery {
+    /// Domain name to analyze
+    domain: String,
+    /// Optional: Set to true to include the list of new page URLs and details in the response. Defaults to false.
+    #[serde(default)]
+    #[param(required = false)]
+    list_pages: Option<bool>,
+    /// Optional: Number of days in the past to check for newly created pages. Defaults to 30.
+    #[serde(default = "default_within_days_new")]
+    #[param(required = false)]
+    within_days: u32,
+}
+
+#[derive(Debug, Serialize, ToSchema, Clone)]
+pub struct NewPageDetail {
+    /// URL of the newly detected page
+    url: String,
+    /// Detected creation date (ISO 8601 format)
+    creation_date: Option<String>,
+    /// Confidence score for the detected date (0.0 - 1.0)
+    confidence: f32,
+    /// Specific method used for detection (e.g., "meta_published_time", "json_ld_date_published", "text_pattern")
+    detection_detail: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub enum DetectionMethod {
+    SitemapLastmod,
+    WordPressApi,
+    HtmlAnalysis,
+    Mixed, // If multiple methods contributed
+    None, // If no method could be applied (e.g., only sitemap URL found)
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct NewPagesResponse {
+    /// Domain that was analyzed
+    domain: String,
+    /// Number of newly created pages found within the specified period
+    new_pages_count: i32,
+    /// Number of days analyzed (period in the past)
+    days_analyzed: u32,
+    /// Primary detection method used (summary)
+    detection_method: DetectionMethod,
+    /// URL of the sitemap that was analyzed (if found)
+    sitemap_url: Option<String>,
+    /// Optional: List of URLs for pages identified as new (present if list_pages=true)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    new_page_urls: Option<Vec<String>>,
+    /// Optional: Detailed information about new pages (present if list_pages=true)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    new_page_details: Option<Vec<NewPageDetail>>,
+    /// URLs from the sitemap that failed during processing (e.g., fetching, date extraction)
+    processing_errors: Vec<String>,
+}
+
+/// Get newly created pages within a specified number of days for a given domain
+#[utoipa::path(
+    get,
+    path = "/research/pages/new",
+    params(NewPagesQuery),
+    responses(
+        (status = 200, description = "Success, analysis complete", body = NewPagesResponse),
+        (status = 422, description = "Unprocessable Entity - Sitemap not found or processing error", body = NewPagesResponse),
+        (status = 500, description = "Internal Server Error during processing")
+    ),
+    description = "Attempts to identify web pages created within a specific number of days by analyzing sitemaps, HTML metadata, and potentially CMS APIs."
+)]
+#[tracing::instrument(skip(query, state), fields(domain = %query.domain, days = %query.within_days))]
+async fn research_new_pages(
+    Query(query): Query<NewPagesQuery>,
+    State(state): State<AppState> // Inject AppState
+) -> impl IntoResponse {
+    let start_time = Instant::now();
+    let days_to_analyze = query.within_days;
+    // Calculate the cutoff date (inclusive)
+    let cutoff_date = Utc::now() - Duration::days(days_to_analyze as i64);
+    let should_list_pages = query.list_pages.unwrap_or(false);
+
+    tracing::info!("Starting new page analysis for {} within {} days (cutoff: {})",
+        query.domain, days_to_analyze, cutoff_date.to_rfc3339());
+
+    let client = state.http_client.clone(); // Use client from state
+
+    // --- Initialize Response ---
+    // Renamed field to be more descriptive
+    let mut response_body = NewPagesResponse {
+        domain: query.domain.clone(),
+        new_pages_count: 0, // Initialize count
+        days_analyzed: days_to_analyze,
+        detection_method: DetectionMethod::None, // Start with None
+        sitemap_url: None,
+        new_page_urls: if should_list_pages { Some(Vec::new()) } else { None },
+        new_page_details: if should_list_pages { Some(Vec::new()) } else { None },
+        processing_errors: Vec::new(),
+    };
+
+    // --- 1. Find Sitemap ---
+    let sitemap_url_result = find_sitemap(&query.domain, client.clone()).await;
+    // ... (existing sitemap finding logic remains the same) ...
+     let sitemap_url = match sitemap_url_result {
+        Ok(Some(url)) => {
+            response_body.sitemap_url = Some(url.clone());
+            tracing::info!("Found sitemap: {}", url);
+            url
+        },
+        Ok(None) => {
+            tracing::warn!("Sitemap not found for {}", query.domain);
+            response_body.processing_errors.push("Sitemap not found".to_string());
+            return (StatusCode::UNPROCESSABLE_ENTITY, Json(response_body)).into_response();
+        },
+        Err(e) => {
+            tracing::error!("Error finding sitemap for {}: {}", query.domain, e);
+            response_body.processing_errors.push(format!("Error finding sitemap: {}", e));
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(response_body)).into_response();
+        }
+    };
+
+
+    // --- 2. Get All URLs from Sitemap ---
+    let all_urls_result = get_all_sitemap_urls(&sitemap_url, client.clone()).await;
+    // ... (existing URL extraction logic remains the same) ...
+     let urls_to_check = match all_urls_result {
+        Ok(urls) => {
+            if urls.is_empty() {
+                tracing::warn!("Sitemap found but contained no URLs: {}", sitemap_url);
+                 return (StatusCode::OK, Json(response_body)).into_response();
+            }
+            tracing::info!("Found {} URLs in sitemap(s) to analyze", urls.len());
+            urls
+        },
+        Err(e) => {
+            tracing::error!("Error extracting URLs from sitemap {}: {}", sitemap_url, e);
+            response_body.processing_errors.push(format!("Error reading sitemap: {}", e));
+            return (StatusCode::UNPROCESSABLE_ENTITY, Json(response_body)).into_response();
+        }
+    };
+
+
+    // --- 3. Process URLs Concurrently ---
+    let detection_futures = urls_to_check.into_iter().map(|url| {
+        let client_clone = client.clone();
+        let url_clone = url.clone(); // Clone URL for the async block
+        tokio::spawn(async move {
+            (url_clone, detect_creation_date(url, client_clone).await)
+        })
+    });
+
+    let detection_span = tracing::info_span!("detect_creation_dates", url_count = detection_futures.len());
+    let detection_results = join_all(detection_futures).instrument(detection_span).await;
+
+    // --- 4. Collect Results and Filter ---
+    let mut found_valid_date = false; // Track if any date was successfully detected and parsed
+
+    for result in detection_results {
+        match result {
+            Err(join_error) => {
+                // Log join errors (panics in spawned tasks)
+                tracing::error!("JoinError during date detection: {}", join_error);
+                // Optionally add a generic error or try to extract URL if possible
+                response_body.processing_errors.push("Task panic during processing".to_string());
+            }
+            Ok((url, Ok(Some(detail)))) => {
+                // Successfully fetched and found a date
+                if let Some(creation_date_str) = &detail.creation_date {
+                    // Attempt to parse the date string back to DateTime<Utc>
+                     match DateTime::parse_from_rfc3339(creation_date_str) {
+                        Ok(parsed_date) => {
+                             found_valid_date = true; // Mark that we used HTML analysis
+                            let creation_date_utc = parsed_date.with_timezone(&Utc);
+
+                            // Check if the date is within the desired range (inclusive)
+                            if creation_date_utc >= cutoff_date {
+                                tracing::debug!("New page detected: {} (Date: {}, Method: {}, Confidence: {:.2})",
+                                    detail.url, creation_date_utc.to_rfc3339(), detail.detection_detail, detail.confidence);
+                                response_body.new_pages_count += 1;
+                                if should_list_pages {
+                                    // Add to lists only if requested
+                                     if let Some(urls) = response_body.new_page_urls.as_mut() {
+                                         urls.push(detail.url.clone());
+                                     }
+                                    if let Some(details) = response_body.new_page_details.as_mut() {
+                                         details.push(detail);
+                                     }
+                                }
+                            } else {
+                                 tracing::trace!("Page date {} is outside the cutoff {} for {}", creation_date_utc.to_rfc3339(), cutoff_date.to_rfc3339(), url);
+                            }
+                        }
+                        Err(parse_err) => {
+                            // Log if the date string from NewPageDetail couldn't be parsed back
+                            tracing::error!("Failed to parse stored date string '{}' for {}: {}", creation_date_str, url, parse_err);
+                             response_body.processing_errors.push(url); // Add URL to errors if date parsing failed
+                        }
+                    }
+                } else {
+                    // Should not happen if detail is Some, but handle defensively
+                     tracing::warn!("NewPageDetail present but creation_date is None for {}", url);
+                    // Don't count as an error unless needed
+                }
+            }
+            Ok((url, Ok(None))) => {
+                // Successfully fetched, but no date found in HTML
+                 tracing::trace!("No date information found in HTML for {}", url);
+                 found_valid_date = true; // Mark that we used HTML analysis, even if no date was found for *this* page
+            }
+            Ok((url, Err(e))) => {
+                // Error fetching or processing the specific URL
+                tracing::warn!("Failed to process URL for date detection {}: {}", url, e);
+                response_body.processing_errors.push(url);
+            }
+        }
+    }
+
+     // --- 5. Set Final Detection Method ---
+     if found_valid_date {
+         // We successfully attempted HTML analysis on at least one page
+         response_body.detection_method = DetectionMethod::HtmlAnalysis;
+         // TODO: In the future, if we add WordPress API checks or Sitemap lastmod checks,
+         // this logic would need to be updated to potentially set Mixed or WordPressApi, etc.
+     } else if response_body.sitemap_url.is_some() && response_body.processing_errors.is_empty() {
+          // If we only had a sitemap and no URLs could be processed for dates (e.g., all failed fetch)
+          // Or if get_all_sitemap_urls returned Ok but empty vec initially (handled earlier)
+          // Keep as None or potentially add a SitemapOnly status if needed
+          tracing::debug!("Analysis completed, but no date information could be extracted via HTML.");
+     }
+     // If errors occurred but no dates found, method remains None or reflects partial success if any page worked.
+
+    // --- Finalize and Return ---
+    // ... (existing logging and return logic) ...
+    let duration = start_time.elapsed();
+    tracing::info!(
+        domain = %query.domain,
+        new_pages_found = response_body.new_pages_count, // Renamed log field
+        pages_analyzed = response_body.new_page_details.as_ref().map_or(0, |d| d.len()) + response_body.processing_errors.len(), // Approximate count
+        errors = response_body.processing_errors.len(),
+        duration_ms = duration.as_millis(),
+        detection_method = ?response_body.detection_method, // Log the method used
+        "New page analysis complete."
+    );
+
+    (StatusCode::OK, Json(response_body)).into_response()
 } 
