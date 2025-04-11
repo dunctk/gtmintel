@@ -59,6 +59,9 @@ COPY --from=builder /app/target/release/gtmintel /app/gtmintel
 RUN apt-get update && apt-get install -y --no-install-recommends libssl3 ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
+RUN apt-get update && apt-get install -y --no-install-recommends build-essential pkg-config libopenblas-dev liblapack-dev && \
+    rm -rf /var/lib/apt/lists/*
+
 
 # Create and switch to a non-root user (recommended)
 RUN groupadd --system appuser && useradd --system --gid appuser --no-create-home appuser
