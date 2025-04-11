@@ -69,6 +69,8 @@ USER appuser
 
 # Environment
 ENV PORT=3000
+ENV LAPACK_PROVIDER=openblas-system
+ENV CBLAS_PROVIDER=openblas-system
 
 # Expose the application port
 EXPOSE 3000
