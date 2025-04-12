@@ -97,8 +97,55 @@ static HTTP_CLIENT: Lazy<ClientWithMiddleware> = Lazy::new(|| {
 struct AppState {
     embedder: Arc<Embedder>,
     http_client: ClientWithMiddleware, // Add the cached client
+    
+    // Random ID generator for job IDs
+    job_id_counter: Arc<std::sync::atomic::AtomicU64>,
 }
 // --- End AppState Definition ---
+
+// --- Webhook common traits ---
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct WebhookRequest {
+    /// Optional webhook URL to send the result to when the job is complete
+    #[serde(default)]
+    webhook_url: Option<String>,
+    
+    /// Optional flag to control whether to send results to the webhook
+    /// If false, only status and job ID will be sent
+    /// Default is true
+    #[serde(default = "default_send_results")]
+    send_results: bool,
+}
+
+// Function to provide the default value for send_results (true)
+fn default_send_results() -> bool {
+    true
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct WebhookAcceptedResponse {
+    /// Unique job ID for tracking the request
+    job_id: String,
+    /// Status of the job
+    status: String,
+}
+
+// Trait to add webhook functionality to request structs
+pub trait WithWebhook {
+    fn webhook_url(&self) -> Option<&String>;
+    fn send_results(&self) -> bool;
+}
+
+impl WithWebhook for WebhookRequest {
+    fn webhook_url(&self) -> Option<&String> {
+        self.webhook_url.as_ref()
+    }
+    
+    fn send_results(&self) -> bool {
+        self.send_results
+    }
+}
+// --- End Webhook common traits ---
 
 #[derive(Debug, Deserialize, ToSchema, IntoParams)]
 #[into_params(parameter_in = Query)]
@@ -113,6 +160,25 @@ pub struct ResearchQuery {
     #[serde(default = "default_within_days")] // Use a function for default
     #[param(required = false)]
     within_days: u32,
+    /// Optional webhook URL to send the result to when the job is complete
+    #[serde(default)]
+    #[param(required = false)]
+    webhook_url: Option<String>,
+    /// Optional flag to control whether to send results to the webhook (default: true)
+    #[serde(default = "default_send_results")]
+    #[param(required = false)]
+    send_results: bool,
+}
+
+// Implement WithWebhook trait for ResearchQuery
+impl WithWebhook for ResearchQuery {
+    fn webhook_url(&self) -> Option<&String> {
+        self.webhook_url.as_ref()
+    }
+    
+    fn send_results(&self) -> bool {
+        self.send_results
+    }
 }
 
 // Function to provide the default value for within_days
@@ -142,6 +208,7 @@ pub struct ResearchResponse {
     params(ResearchQuery),
     responses(
         (status = 200, description = "Success, sitemap found and processed", body = ResearchResponse),
+        (status = 202, description = "Request accepted for processing via webhook", body = WebhookAcceptedResponse),
         (status = 422, description = "Unprocessable Entity - Sitemap not found", body = ResearchResponse)
     )
 )]
@@ -149,7 +216,83 @@ pub struct ResearchResponse {
 async fn research_pages(
     Query(query): Query<ResearchQuery>,
     State(state): State<AppState> // Inject AppState
-) -> impl IntoResponse {
+) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
+    // Check if webhook is requested
+    if let Some(webhook_url) = query.webhook_url() {
+        // Create a job ID
+        let job_id = generate_job_id(&state.job_id_counter);
+        
+        // Set up webhook response
+        let webhook_response = WebhookAcceptedResponse {
+            job_id: job_id.clone(),
+            status: "accepted".to_string(),
+        };
+        
+        // Clone data needed for the async task
+        let domain = query.domain.clone();
+        let days_to_analyze = query.within_days;
+        let should_list_pages = query.list_pages.unwrap_or(false);
+        let send_results = query.send_results();
+        let webhook_url = webhook_url.clone();
+        let client = state.http_client.clone();
+        
+        // Spawn async task to process the request and send webhook
+        tokio::spawn(async move {
+            // Create a separate clone for the process_fn
+            let client_for_processing = client.clone();
+            
+            let process_fn = || async {
+                // Initialize response body
+                let mut response_body = ResearchResponse {
+                    domain: domain.clone(),
+                    updated_pages: 0,
+                    days_analyzed: days_to_analyze,
+                    sitemap_url: None,
+                    updated_page_urls: None,
+                };
+                
+                // Find sitemap
+                let sitemap_result = find_sitemap(&domain, client_for_processing.clone()).await;
+                
+                match sitemap_result {
+                    Ok(Some(sitemap_url)) => {
+                        response_body.sitemap_url = Some(sitemap_url.clone());
+                        // Count recent pages
+                        match count_recent_pages(&sitemap_url, days_to_analyze, client_for_processing.clone()).await {
+                            Ok((count, urls)) => {
+                                response_body.updated_pages = count;
+                                if should_list_pages {
+                                    response_body.updated_page_urls = Some(urls);
+                                }
+                                tracing::info!("Found {} pages updated within {} days in sitemap", count, days_to_analyze);
+                                Ok(response_body)
+                            },
+                            Err(e) => {
+                                tracing::error!("Error counting pages from sitemap: {}", e);
+                                Ok(response_body)
+                            }
+                        }
+                    },
+                    Ok(None) => {
+                        tracing::info!("No sitemap found");
+                        Err("No sitemap found".into())
+                    },
+                    Err(e) => {
+                        tracing::error!("Error finding sitemap: {}", e);
+                        Err(format!("Error finding sitemap: {}", e).into())
+                    }
+                }
+            };
+            
+            // Process the request and send results to webhook
+            process_async_webhook_request(webhook_url, job_id, send_results, client, process_fn).await;
+        });
+        
+        // Return accepted response immediately
+        return Ok((StatusCode::ACCEPTED, Json(serde_json::to_value(webhook_response)?)));
+    }
+    
+    // Handle synchronous request (no webhook)
     // Pass the client from state to find_sitemap
     let sitemap_result = find_sitemap(&query.domain, state.http_client.clone()).await;
 
@@ -178,21 +321,21 @@ async fn research_pages(
                         response_body.updated_page_urls = Some(urls);
                     }
                     tracing::info!("Found {} pages updated within {} days in sitemap", count, days_to_analyze);
-                    (StatusCode::OK, Json(response_body))
+                    Ok((StatusCode::OK, Json(serde_json::to_value(response_body)?)))
                 },
                 Err(e) => {
                     tracing::error!("Error counting pages from sitemap: {}", e);
-                    (StatusCode::OK, Json(response_body))
+                    Ok((StatusCode::OK, Json(serde_json::to_value(response_body)?)))
                 }
             }
         },
         Ok(None) => {
             tracing::info!("No sitemap found");
-            (StatusCode::UNPROCESSABLE_ENTITY, Json(response_body))
+            Ok((StatusCode::UNPROCESSABLE_ENTITY, Json(serde_json::to_value(response_body)?)))
         },
         Err(e) => {
             tracing::error!("Error finding sitemap: {}", e);
-            (StatusCode::UNPROCESSABLE_ENTITY, Json(response_body))
+            Ok((StatusCode::UNPROCESSABLE_ENTITY, Json(serde_json::to_value(response_body)?)))
         }
     }
 }
@@ -410,12 +553,115 @@ async fn health_check() -> impl IntoResponse {
         NewPagesQuery,
         NewPagesResponse,
         NewPageDetail,
-        DetectionMethod
+        DetectionMethod,
+        WebhookRequest,
+        WebhookAcceptedResponse
     ))
 )]
 struct ApiDoc;
 
 /// Create the application with all routes and middleware
+// --- Webhook utility functions ---
+/// Generate a unique job ID
+fn generate_job_id(counter: &std::sync::atomic::AtomicU64) -> String {
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    
+    let next_id = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    format!("job_{:x}_{:x}", timestamp, next_id)
+}
+
+/// Send results to a webhook URL
+async fn send_to_webhook<T: Serialize>(
+    webhook_url: &str, 
+    job_id: &str, 
+    send_results: bool, 
+    result: T,
+    client: &ClientWithMiddleware
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    // If send_results is false, only send status and job ID
+    let payload = if send_results {
+        // Full response with results
+        serde_json::json!({
+            "job_id": job_id,
+            "status": "completed",
+            "result": result
+        })
+    } else {
+        // Just status and ID
+        serde_json::json!({
+            "job_id": job_id,
+            "status": "completed"
+        })
+    };
+
+    // Convert to string since ClientWithMiddleware doesn't have .json method
+    let payload_string = serde_json::to_string(&payload)?;
+    
+    let response = client.post(webhook_url)
+        .header("Content-Type", "application/json")
+        .body(payload_string)
+        .send()
+        .await?;
+    
+    if !response.status().is_success() {
+        return Err(format!("Webhook request failed: {}", response.status()).into());
+    }
+    
+    Ok(())
+}
+
+/// Process a request asynchronously and send results to webhook
+async fn process_async_webhook_request<F, Fut, T>(
+    webhook_url: String,
+    job_id: String,
+    send_results: bool,
+    client: ClientWithMiddleware,
+    process_fn: F
+) where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<T, Box<dyn Error + Send + Sync>>>,
+    T: Serialize + 'static,
+{
+    let result = process_fn().await;
+    
+    match result {
+        Ok(data) => {
+            if let Err(e) = send_to_webhook(&webhook_url, &job_id, send_results, data, &client).await {
+                tracing::error!("Failed to send webhook response: {}", e);
+            }
+        },
+        Err(e) => {
+            // Send error to webhook
+            let error_payload = serde_json::json!({
+                "job_id": job_id,
+                "status": "error",
+                "error": e.to_string()
+            });
+            
+            // Convert to string since ClientWithMiddleware doesn't have .json method
+            match serde_json::to_string(&error_payload) {
+                Ok(payload_string) => {
+                    if let Err(webhook_err) = client.post(&webhook_url)
+                        .header("Content-Type", "application/json")
+                        .body(payload_string)
+                        .send()
+                        .await
+                    {
+                        tracing::error!("Failed to send error to webhook: {}", webhook_err);
+                    }
+                },
+                Err(json_err) => {
+                    tracing::error!("Failed to serialize error payload: {}", json_err);
+                }
+            }
+        }
+    }
+}
+// --- End Webhook utility functions ---
+
 pub fn create_app() -> Router {
     // Build our API documentation (needed regardless for ApiDoc::openapi())
     let api_doc = ApiDoc::openapi();
@@ -425,10 +671,11 @@ pub fn create_app() -> Router {
     // --- Get the globally initialized HTTP client ---
     let shared_http_client = HTTP_CLIENT.clone();
 
-    // Create the application state with both client and embedder
+    // Create the application state with client, embedder, and job counter
     let app_state = AppState {
         embedder: shared_embedder,
         http_client: shared_http_client, // Add the client to the state
+        job_id_counter: Arc::new(std::sync::atomic::AtomicU64::new(0)),
     };
 
     // --- Define API routes separately ---
