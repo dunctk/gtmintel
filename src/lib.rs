@@ -1984,6 +1984,25 @@ pub struct NewPagesQuery {
     #[serde(default = "default_within_days_new")]
     #[param(required = false)] // Add this attribute for query parameters
     within_days: u32,
+    /// Optional webhook URL to send the result to when the job is complete
+    #[serde(default)]
+    #[param(required = false)]
+    webhook_url: Option<String>,
+    /// Optional flag to control whether to send results to the webhook (default: true)
+    #[serde(default = "default_send_results")]
+    #[param(required = false)]
+    send_results: bool,
+}
+
+// Implement WithWebhook trait for NewPagesQuery
+impl WithWebhook for NewPagesQuery {
+    fn webhook_url(&self) -> Option<&String> {
+        self.webhook_url.as_ref()
+    }
+    
+    fn send_results(&self) -> bool {
+        self.send_results
+    }
 }
 // --- END EDIT ---
 
@@ -2226,29 +2245,105 @@ async fn research_new_pages(
     request_body = NewPagesQuery,
     responses(
         (status = 200, description = "Success, analysis complete for all requested domains", body = Vec<NewPagesResponse>),
+        (status = 202, description = "Request accepted for processing via webhook", body = WebhookAcceptedResponse),
         (status = 422, description = "Unprocessable Entity - Invalid input (e.g., too many domains)", body = String),
         (status = 500, description = "Internal Server Error during processing for one or more domains")
     ),
-    description = "..."
+    description = "Batch analyzes multiple domains for new pages, with optional webhook support for asynchronous processing"
 )]
 #[tracing::instrument(skip(query, state), fields(domains = ?query.domains, days = %query.within_days))] // Changed field name 'domain' to 'domains' and formatter '%' to '?'
 async fn research_new_pages_batch( // Function name matches
     State(state): State<AppState>,
     Json(query): Json<NewPagesQuery> // query is Json<NewPagesQuery> here
-) -> impl IntoResponse {
+) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
     // --- EDIT: Add logging inside the function body ---
     // Now 'query' refers to the extracted NewPagesQuery struct
-    tracing::info!(domains_count = query.domains.len(), days = query.within_days, "Received batch request for new pages");
+    tracing::info!(domains_count = query.domains.len(), days = query.within_days, webhook = ?query.webhook_url.is_some(), "Received batch request for new pages");
     // --- END EDIT ---
+    
+    // Check if webhook is requested
+    if let Some(webhook_url) = query.webhook_url() {
+        // Create a job ID
+        let job_id = generate_job_id(&state.job_id_counter);
+        
+        // Set up webhook response
+        let webhook_response = WebhookAcceptedResponse {
+            job_id: job_id.clone(),
+            status: "accepted".to_string(),
+        };
+        
+        // Clone data needed for the async task
+        let domains = query.domains.clone();
+        let days_to_analyze = query.within_days;
+        let should_list_pages = query.list_pages.unwrap_or(false);
+        let send_results = query.send_results();
+        let webhook_url = webhook_url.clone();
+        let client = state.http_client.clone();
+        let app_state = state.clone();
+        
+        // Spawn async task to process the request and send webhook
+        tokio::spawn(async move {
+            let process_fn = || async {
+                let start_time = Instant::now();
+                const MAX_DOMAINS: usize = 20;
 
+                if domains.is_empty() {
+                    return Err("No domains provided".into());
+                }
+
+                if domains.len() > MAX_DOMAINS {
+                    return Err(format!("Too many domains. Maximum allowed is {}", MAX_DOMAINS).into());
+                }
+                
+                // Create a new query with the cloned data
+                let new_query = NewPagesQuery {
+                    domains,
+                    list_pages: Some(should_list_pages),
+                    within_days: days_to_analyze,
+                    webhook_url: None, // No nested webhook
+                    send_results,
+                };
+                
+                // Process domains using analyze_multiple_domains_for_new_pages
+                match analyze_multiple_domains_for_new_pages(
+                    State(app_state.clone()), 
+                    Json(new_query)
+                ).await {
+                    Ok(responses) => {
+                        let duration = start_time.elapsed();
+                        tracing::info!(
+                            duration_ms = duration.as_millis(),
+                            response_count = responses.0.len(),
+                            "Batch new page analysis complete for webhook"
+                        );
+                        Ok(responses.0)
+                    },
+                    Err(e) => {
+                        tracing::error!("Error analyzing domains for webhook: {}", e);
+                        Err(format!("Error processing request: {}", e).into())
+                    }
+                }
+            };
+            
+            // Process the request and send results to webhook
+            process_async_webhook_request(webhook_url, job_id, send_results, client, process_fn).await;
+        });
+        
+        // Return accepted response immediately
+        return Ok((StatusCode::ACCEPTED, Json(serde_json::to_value(webhook_response)?)));
+    }
+
+    // Handle synchronous request (no webhook)
     let start_time = Instant::now();
     const MAX_DOMAINS: usize = 20;
 
     if query.domains.is_empty() {
-        // ... error handling ...
+        return Err(AppError::InvalidRequest("No domains provided".to_string()));
     }
     if query.domains.len() > MAX_DOMAINS {
-        // ... error handling ...
+        return Err(AppError::InvalidRequest(
+            format!("Too many domains. Maximum allowed is {}", MAX_DOMAINS))
+        );
     }
 
     let client = state.http_client.clone();
@@ -2303,7 +2398,7 @@ async fn research_new_pages_batch( // Function name matches
         "Batch new page analysis complete."
     );
 
-    (StatusCode::OK, Json(final_responses)).into_response()
+    Ok((StatusCode::OK, Json(serde_json::to_value(final_responses)?)))
 }
 
 // ... other functions ...
