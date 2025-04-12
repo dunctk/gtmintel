@@ -1599,11 +1599,11 @@ async fn crawl_domains(
     (StatusCode::OK, Json(results)).into_response()
 }
 
-#[tracing::instrument(skip(domain, client), fields(domain = %domain, max_pages = %max_pages))]
+#[tracing::instrument(skip(domain), fields(domain = %domain, max_pages = %max_pages))]
 async fn crawl_single_domain(
     domain: &str,
     max_pages: usize,
-    client: ClientWithMiddleware // Accept client
+    _client: ClientWithMiddleware // Accept client but mark as unused with underscore
 ) -> CrawlDomainsResponse {
     let domain_with_protocol = if domain.starts_with("http") {
         domain.to_string()

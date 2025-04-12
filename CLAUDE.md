@@ -9,6 +9,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Test single: `cargo test test_name` (e.g., `cargo test test_health_endpoint`)
 - Format: `cargo fmt`
 - Lint: `cargo clippy`
+- Check test coverage: `cargo llvm-cov --text`
 
 ## Code Style
 - **Formatting**: Use standard Rust formatting with `cargo fmt`
