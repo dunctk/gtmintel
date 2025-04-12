@@ -1790,6 +1790,14 @@ pub struct CrawlDomainsRequest {
     /// Maximum number of pages to crawl per domain (default: 10)
     #[serde(default = "default_max_pages")]
     max_pages: usize,
+    /// Optional webhook URL to send the result to when the job is complete
+    #[serde(default)]
+    webhook_url: Option<String>,
+    /// Optional flag to control whether to send results to the webhook
+    /// If false, only status and job ID will be sent
+    /// Default is true
+    #[serde(default = "default_send_results")]
+    send_results: bool,
 }
 
 fn default_max_pages() -> usize {
@@ -1814,6 +1822,17 @@ pub struct CrawlDomainsResponse {
     pages: Vec<PageInfo>,
 }
 
+// Implement WithWebhook trait for CrawlDomainsRequest
+impl WithWebhook for CrawlDomainsRequest {
+    fn webhook_url(&self) -> Option<&String> {
+        self.webhook_url.as_ref()
+    }
+    
+    fn send_results(&self) -> bool {
+        self.send_results
+    }
+}
+
 /// Crawl multiple domains and extract page information (URLs, titles, meta descriptions)
 #[utoipa::path(
     post,
@@ -1821,6 +1840,7 @@ pub struct CrawlDomainsResponse {
     request_body = CrawlDomainsRequest,
     responses(
         (status = 200, description = "Successfully crawled domains", body = Vec<CrawlDomainsResponse>),
+        (status = 202, description = "Request accepted for processing via webhook", body = WebhookAcceptedResponse),
         (status = 422, description = "Invalid request parameters")
     )
 )]
@@ -1828,12 +1848,56 @@ pub struct CrawlDomainsResponse {
 async fn crawl_domains(
     State(state): State<AppState>, // Inject AppState
     Json(request): Json<CrawlDomainsRequest>
-) -> impl IntoResponse {
+) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
     if request.domains.is_empty() {
-        return (StatusCode::UNPROCESSABLE_ENTITY, Json(Vec::<CrawlDomainsResponse>::new())).into_response();
+        return Err(AppError::InvalidRequest("No domains provided".to_string()));
     }
 
-    let client = state.http_client; // Get client from state
+    // Check if webhook is requested
+    if let Some(webhook_url) = request.webhook_url() {
+        // Create a job ID
+        let job_id = generate_job_id(&state.job_id_counter);
+        
+        // Set up webhook response
+        let webhook_response = WebhookAcceptedResponse {
+            job_id: job_id.clone(),
+            status: "accepted".to_string(),
+        };
+        
+        // Clone data needed for the async task
+        let domains = request.domains.clone();
+        let max_pages = request.max_pages;
+        let send_results = request.send_results();
+        let webhook_url = webhook_url.clone();
+        let client = state.http_client.clone();
+        
+        // Spawn async task to process the request and send webhook
+        tokio::spawn(async move {
+            // Create a separate clone for the process_fn
+            let client_for_processing = client.clone();
+            
+            let process_fn = || async {
+                let crawl_futures = domains.iter().map(|domain| {
+                    // Pass the client to crawl_single_domain
+                    crawl_single_domain(domain, max_pages, client_for_processing.clone())
+                });
+                
+                let crawl_span = tracing::info_span!("crawl_all_requested_domains");
+                let results = join_all(crawl_futures).instrument(crawl_span).await;
+                
+                Ok(results)
+            };
+            
+            // Process the request and send results to webhook
+            process_async_webhook_request(webhook_url, job_id, send_results, client, process_fn).await;
+        });
+        
+        // Return accepted response immediately
+        return Ok((StatusCode::ACCEPTED, Json(serde_json::to_value(webhook_response)?)));
+    }
+
+    // Handle synchronous request (no webhook)
+    let client = state.http_client.clone();
 
     let crawl_futures = request.domains.iter().map(|domain| {
         // Pass the client to crawl_single_domain
@@ -1843,7 +1907,7 @@ async fn crawl_domains(
     let crawl_span = tracing::info_span!("crawl_all_requested_domains");
     let results = join_all(crawl_futures).instrument(crawl_span).await;
     
-    (StatusCode::OK, Json(results)).into_response()
+    Ok((StatusCode::OK, Json(serde_json::to_value(results)?)))
 }
 
 #[tracing::instrument(skip(domain), fields(domain = %domain, max_pages = %max_pages))]
