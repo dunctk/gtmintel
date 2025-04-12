@@ -7,7 +7,7 @@ use axum::{
     routing::{get, post},
     Router,
     Json,
-    response::IntoResponse,
+    response::{IntoResponse, Redirect},
     http::StatusCode,
 };
 // Conditionally import SwaggerUi only when needed (not test)
@@ -716,6 +716,8 @@ pub fn create_app() -> Router {
     // --- Build the final application router ---
     // Start with the rate-limited API routes and merge the docs router
     let mut app = Router::new()
+        // --- Add the root redirect route ---
+        .route("/", get(|| async { Redirect::temporary("/docs") })) // <-- Add this line
         .merge(rate_limited_api_routes) // Add rate-limited API routes
         .merge(docs_router);            // Add documentation routes (not rate-limited)
 
