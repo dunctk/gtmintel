@@ -3,12 +3,13 @@ pub mod error;
 
 // Then your existing imports can stay as they are
 use axum::{
-    extract::{Query, State},
+    extract::{Query, State, Request},
     routing::{get, post},
     Router,
     Json,
-    response::{IntoResponse, Redirect},
+    response::{IntoResponse, Redirect, Response},
     http::StatusCode,
+    middleware::Next,
 };
 // Conditionally import SwaggerUi only when needed (not test)
 #[cfg(not(test))]
@@ -65,6 +66,7 @@ use chrono::{DateTime}; // Add Utc for parsing
 use regex::Regex; // Already imported, ensure it's available
 use chrono::TimeZone;
 use crate::error::AppError;
+use std::env;
 
 // --- Global Embedder Initialization ---
 // Place this near the top, after imports
@@ -100,6 +102,7 @@ struct AppState {
     
     // Random ID generator for job IDs
     job_id_counter: Arc<std::sync::atomic::AtomicU64>,
+    api_keys: Arc<HashSet<String>>, // Add this line
 }
 // --- End AppState Definition ---
 
@@ -538,15 +541,16 @@ async fn health_check() -> impl IntoResponse {
         health_check,
         crawl_domains,
         compare_domain_pages,
-        research_new_pages
+        research_new_pages,
+        research_new_pages_batch // Ensure batch endpoint is listed
     ),
     components(schemas(
-        ResearchQuery, 
+        ResearchQuery,
         ResearchResponse,
         CrawlDomainsRequest,
         CrawlDomainsResponse,
         PageInfo,
-        CompareDomainsRequest,
+        CompareDomainsRequest, // Ensure this includes webhook fields in schema
         CompareDomainsResponse,
         SimilarPagePair,
         PageMetadata,
@@ -554,8 +558,8 @@ async fn health_check() -> impl IntoResponse {
         NewPagesResponse,
         NewPageDetail,
         DetectionMethod,
-        WebhookRequest,
-        WebhookAcceptedResponse
+        WebhookRequest,         // Generic webhook fields
+        WebhookAcceptedResponse // Standard accepted response
     ))
 )]
 struct ApiDoc;
@@ -663,37 +667,50 @@ async fn process_async_webhook_request<F, Fut, T>(
 // --- End Webhook utility functions ---
 
 pub fn create_app() -> Router {
-    // Build our API documentation (needed regardless for ApiDoc::openapi())
-    let api_doc = ApiDoc::openapi();
+    // --- Load API Keys from .env ---
+    dotenvy::dotenv().expect("Failed to load .env file. Create one with API_KEYS variable.");
+    let keys_str = env::var("API_KEYS").expect("API_KEYS must be set in .env (comma-separated)");
+    let api_keys: HashSet<String> = keys_str.split(',')
+                                        .map(|s| s.trim().to_string())
+                                        .filter(|s| !s.is_empty()) // Avoid empty keys if there are trailing commas
+                                        .collect();
+    if api_keys.is_empty() {
+        panic!("No valid API_KEYS found in .env file.");
+    }
+    let shared_api_keys = Arc::new(api_keys);
+    tracing::info!("Loaded {} API key(s)", shared_api_keys.len());
+    // --- End API Key Loading ---
 
-    // --- Get the globally initialized embedder ---
+
+    let api_doc = ApiDoc::openapi();
     let shared_embedder = TEXT_EMBEDDER.clone();
-    // --- Get the globally initialized HTTP client ---
     let shared_http_client = HTTP_CLIENT.clone();
 
-    // Create the application state with client, embedder, and job counter
     let app_state = AppState {
         embedder: shared_embedder,
-        http_client: shared_http_client, // Add the client to the state
+        http_client: shared_http_client,
         job_id_counter: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        api_keys: shared_api_keys, // Add loaded keys to state
     };
 
-    // --- Define API routes separately ---
-    let api_routes = Router::new()
+    // --- Define protected API routes ---
+    let protected_api_routes = Router::new()
         .route("/research/pages/updated", get(research_pages))
-        .route("/health", get(health_check))
         .route("/research/crawl", post(crawl_domains))
         .route("/research/similar-pages", post(compare_domain_pages))
         .route("/research/pages/new/batch", post(research_new_pages_batch))
-        .with_state(app_state.clone()); // Pass state to API routes
-        
+        // Apply the authentication middleware to this group
+        .route_layer(axum::middleware::from_fn_with_state(app_state.clone(), api_key_auth));
+
+    // --- Define public routes (no auth needed) ---
+    let public_routes = Router::new()
+        .route("/health", get(health_check))
+        .route("/", get(|| async { Redirect::temporary("/docs") })); // Root redirect
+
     // --- Conditionally apply layers and Swagger UI only when NOT running tests ---
     #[cfg(not(test))]
-    let (docs_router, rate_limited_api_routes) = {
-        // Create Swagger UI router
+    let (docs_router, rate_limited_protected_routes) = {
         let docs_router = SwaggerUi::new("/docs").url("/api-doc/openapi.json", api_doc);
-
-        // Configure Rate Limiting
         let governor_conf = Arc::new(
             GovernorConfigBuilder::default()
                 .key_extractor(SmartIpKeyExtractor)
@@ -702,27 +719,22 @@ pub fn create_app() -> Router {
                 .finish()
                 .unwrap(),
         );
-        // Apply Governor layer ONLY to the api_routes defined above
-        let rate_limited_api_routes = api_routes.layer(GovernorLayer { config: governor_conf });
-
-        (docs_router, rate_limited_api_routes)
+        // Apply rate limiting ONLY to the protected routes
+        let rate_limited_protected_routes = protected_api_routes.layer(GovernorLayer { config: governor_conf });
+        (docs_router, rate_limited_protected_routes)
     };
 
-    // For test builds, use the original api_routes and an empty router for docs
     #[cfg(test)]
-    let (docs_router, rate_limited_api_routes) = (Router::new(), api_routes);
-
+    let (docs_router, rate_limited_protected_routes) = (Router::new(), protected_api_routes); // No rate limit in test
 
     // --- Build the final application router ---
-    // Start with the rate-limited API routes and merge the docs router
     let mut app = Router::new()
-        // --- Add the root redirect route ---
-        .route("/", get(|| async { Redirect::temporary("/docs") })) // <-- Add this line
-        .merge(rate_limited_api_routes) // Add rate-limited API routes
-        .merge(docs_router);            // Add documentation routes (not rate-limited)
+        .merge(public_routes)                // Public routes first
+        .merge(rate_limited_protected_routes) // Then protected (and potentially rate-limited) routes
+        .merge(docs_router)                 // Finally, docs
+        .with_state(app_state);             // Pass the full state
 
 
-    // --- Apply CORS to the whole app (both API and docs) if needed ---
     #[cfg(not(test))]
     {
         app = app.layer(
@@ -733,7 +745,6 @@ pub fn create_app() -> Router {
         );
     }
 
-    // Return the final router
     app
 }
 
@@ -747,10 +758,29 @@ pub struct CompareDomainsRequest {
     #[serde(default = "default_similarity_threshold")]
     #[schema(example = 0.75)]
     similarity_threshold: f64,
+    /// Optional webhook URL to send the result to when the job is complete
+    #[serde(default)]
+    // #[param(required = false)] // REMOVE this attribute
+    webhook_url: Option<String>,
+    /// Optional flag to control whether to send results to the webhook (default: true)
+    #[serde(default = "default_send_results")]
+    // #[param(required = false)] // REMOVE this attribute
+    send_results: bool,
 }
 
 fn default_similarity_threshold() -> f64 {
     0.7
+}
+
+// Implement WithWebhook trait for CompareDomainsRequest
+impl WithWebhook for CompareDomainsRequest {
+    fn webhook_url(&self) -> Option<&String> {
+        self.webhook_url.as_ref()
+    }
+
+    fn send_results(&self) -> bool {
+        self.send_results
+    }
 }
 
 #[derive(Debug, Serialize, ToSchema, Clone)]
@@ -1527,61 +1557,140 @@ async fn fetch_and_process_page(
     request_body = CompareDomainsRequest,
     responses(
         (status = 200, description = "Comparison complete, returns pairs of pages with similar semantic content", body = CompareDomainsResponse),
-        (status = 422, description = "Unprocessable Entity - Error finding/processing sitemaps or invalid request"),
-        (status = 500, description = "Internal Server Error during processing or embedding model failure"),
+        (status = 202, description = "Request accepted for processing via webhook", body = WebhookAcceptedResponse), // Added 202
+        (status = 422, description = "Unprocessable Entity - Error finding/processing sitemaps or invalid request", body = String), // Changed body example
+        (status = 500, description = "Internal Server Error during processing or embedding model failure", body = String) // Changed body example
     ),
-    description = "Compares pages between two domains based on semantic content similarity using embeddings. Provide domains and a cosine similarity threshold."
+    description = "Compares pages between two domains based on semantic content similarity using embeddings. Provide domains and a cosine similarity threshold. Supports webhook for async results." // Updated description
 )]
 #[tracing::instrument(skip(request, state), fields(domain_a = %request.domain_a, domain_b = %request.domain_b))]
 async fn compare_domain_pages(
     State(state): State<AppState>,
     Json(request): Json<CompareDomainsRequest>
-) -> impl IntoResponse {
+) -> Result<(StatusCode, Json<serde_json::Value>), AppError> { // Return type changed for flexibility
+    // Check if webhook is requested
+    if let Some(webhook_url) = request.webhook_url() {
+        // Create a job ID
+        let job_id = generate_job_id(&state.job_id_counter);
+
+        // Set up webhook response
+        let webhook_response = WebhookAcceptedResponse {
+            job_id: job_id.clone(),
+            status: "accepted".to_string(),
+        };
+
+        // Clone data needed for the async task
+        let domain_a = request.domain_a.clone();
+        let domain_b = request.domain_b.clone();
+        let similarity_threshold = request.similarity_threshold;
+        let send_results = request.send_results();
+        let webhook_url = webhook_url.clone();
+        let client = state.http_client.clone(); // Original client clone
+        let embedder = state.embedder.clone(); // Clone Arc<Embedder>
+
+        // --- FIX: Clone client specifically for the process_fn closure ---
+        let client_for_process_fn = client.clone();
+
+        // Spawn async task to process the request and send webhook
+        tokio::spawn(async move {
+            // Prepare the actual analysis function call within a closure
+            let process_fn = || async {
+                analyze_domain_similarity(
+                    domain_a,
+                    domain_b,
+                    similarity_threshold,
+                    // --- FIX: Use the clone specific to this closure ---
+                    client_for_process_fn, // Use the clone intended for the closure
+                    embedder.clone(),      // Pass cloned embedder
+                ).await
+                 .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>) // Convert AppError to Box<dyn Error>
+            };
+
+            // Process the request and send results to webhook
+            // --- FIX: Pass the original client clone (or another fresh one) ---
+            process_async_webhook_request(webhook_url, job_id, send_results, client, process_fn).await; // Pass the original 'client' clone here
+        });
+
+        // Return accepted response immediately
+        return Ok((StatusCode::ACCEPTED, Json(serde_json::to_value(webhook_response)?)));
+    }
+
+    // Handle synchronous request (no webhook)
+    match analyze_domain_similarity(
+        request.domain_a,
+        request.domain_b,
+        request.similarity_threshold,
+        state.http_client.clone(),
+        state.embedder.clone(),
+    ).await {
+        Ok(response_data) => Ok((StatusCode::OK, Json(serde_json::to_value(response_data)?))),
+        Err(app_error) => {
+            // Map AppError to appropriate status code and JSON response
+             match app_error {
+                 AppError::InvalidRequest(msg) | AppError::UnprocessableEntity(msg) => {
+                     Ok((StatusCode::UNPROCESSABLE_ENTITY, Json(serde_json::json!({"error": msg}))))
+                 },
+                 AppError::InternalError(msg) => {
+                     Ok((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": msg}))))
+                 },
+                 // Add other error types if needed
+                 _ => {
+                     Ok((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": app_error.to_string()}))))
+                 }
+             }
+        }
+    }
+}
+
+// --- Helper function for core similarity analysis logic ---
+#[tracing::instrument(skip(client, embedder), fields(domain_a = %domain_a, domain_b = %domain_b, threshold = %similarity_threshold))]
+async fn analyze_domain_similarity(
+    domain_a: String,
+    domain_b: String,
+    similarity_threshold: f64,
+    client: ClientWithMiddleware, // Accept client
+    embedder: Arc<Embedder>,       // Accept embedder
+) -> Result<CompareDomainsResponse, AppError> { // Return Result<CompareDomainsResponse, AppError>
     let start_time = Instant::now();
 
-    if !(0.0..=1.0).contains(&request.similarity_threshold) {
-         return (StatusCode::UNPROCESSABLE_ENTITY, Json(serde_json::json!({
-             "error": "similarity_threshold must be between 0.0 and 1.0"
-         }))).into_response();
+    if !(0.0..=1.0).contains(&similarity_threshold) {
+         return Err(AppError::InvalidRequest(
+             "similarity_threshold must be between 0.0 and 1.0".to_string()
+         ));
     }
 
     tracing::info!("Starting semantic page comparison for {} vs {} with threshold {}",
-        request.domain_a, request.domain_b, request.similarity_threshold);
-
-    let embedder = state.embedder;
-    let client = state.http_client;
+        domain_a, domain_b, similarity_threshold);
 
     // --- Get Sitemap URLs ---
-    let sitemap_url_a = match find_sitemap(&request.domain_a, client.clone()).await {
+    let sitemap_url_a = match find_sitemap(&domain_a, client.clone()).await {
         Ok(Some(url)) => url,
         Ok(None) => {
-            tracing::error!("Sitemap not found for domain_a: {}", request.domain_a);
-            return (StatusCode::UNPROCESSABLE_ENTITY, Json(CompareDomainsResponse {
-                domain_a: request.domain_a, domain_b: request.domain_b,
-                similar_pages: vec![],
-                domain_a_processing_errors: vec!["Sitemap not found".to_string()],
-                domain_b_processing_errors: vec![],
-            })).into_response();
+            tracing::error!("Sitemap not found for domain_a: {}", domain_a);
+            return Err(AppError::UnprocessableEntity(format!(
+                "Sitemap not found for domain {}", domain_a
+            )));
         },
         Err(e) => {
-            tracing::error!("Error finding sitemap for domain_a {}: {}", request.domain_a, e);
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": format!("Error finding sitemap for domain_a: {}", e)}))).into_response();
+            tracing::error!("Error finding sitemap for domain_a {}: {}", domain_a, e);
+             return Err(AppError::InternalError(format!(
+                 "Error finding sitemap for domain {}: {}", domain_a, e
+             )));
         }
     };
-    let sitemap_url_b = match find_sitemap(&request.domain_b, client.clone()).await {
+    let sitemap_url_b = match find_sitemap(&domain_b, client.clone()).await {
         Ok(Some(url)) => url,
         Ok(None) => {
-            tracing::error!("Sitemap not found for domain_b: {}", request.domain_b);
-             return (StatusCode::UNPROCESSABLE_ENTITY, Json(CompareDomainsResponse {
-                domain_a: request.domain_a, domain_b: request.domain_b,
-                similar_pages: vec![],
-                domain_a_processing_errors: vec![],
-                domain_b_processing_errors: vec!["Sitemap not found".to_string()],
-            })).into_response();
+            tracing::error!("Sitemap not found for domain_b: {}", domain_b);
+             return Err(AppError::UnprocessableEntity(format!(
+                 "Sitemap not found for domain {}", domain_b
+             )));
         },
         Err(e) => {
-            tracing::error!("Error finding sitemap for domain_b {}: {}", request.domain_b, e);
-             return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": format!("Error finding sitemap for domain_b: {}", e)}))).into_response();
+            tracing::error!("Error finding sitemap for domain_b {}: {}", domain_b, e);
+            return Err(AppError::InternalError(format!(
+                 "Error finding sitemap for domain {}: {}", domain_b, e
+             )));
         }
     };
 
@@ -1589,30 +1698,36 @@ async fn compare_domain_pages(
     let urls_a = match get_all_sitemap_urls(&sitemap_url_a, client.clone()).await {
         Ok(urls) => urls,
         Err(e) => {
-            tracing::error!("Error getting URLs for domain_a {}: {}", request.domain_a, e);
-            return (StatusCode::UNPROCESSABLE_ENTITY, Json(serde_json::json!({ "error": format!("Error processing sitemap for domain_a: {}", e)}))).into_response();
+            tracing::error!("Error getting URLs for domain_a {}: {}", domain_a, e);
+            return Err(AppError::UnprocessableEntity(format!(
+                "Error processing sitemap for domain {}: {}", domain_a, e
+            )));
         }
     };
      let urls_b = match get_all_sitemap_urls(&sitemap_url_b, client.clone()).await {
         Ok(urls) => urls,
          Err(e) => {
-            tracing::error!("Error getting URLs for domain_b {}: {}", request.domain_b, e);
-            return (StatusCode::UNPROCESSABLE_ENTITY, Json(serde_json::json!({ "error": format!("Error processing sitemap for domain_b: {}", e)}))).into_response();
+            tracing::error!("Error getting URLs for domain_b {}: {}", domain_b, e);
+            return Err(AppError::UnprocessableEntity(format!(
+                "Error processing sitemap for domain {}: {}", domain_b, e
+            )));
         }
     };
 
      if urls_a.is_empty() || urls_b.is_empty() {
          tracing::warn!("One or both domains have zero URLs in sitemap. A: {}, B: {}", urls_a.len(), urls_b.len());
-         return (StatusCode::OK, Json(CompareDomainsResponse {
-                domain_a: request.domain_a, domain_b: request.domain_b,
+         // Return an Ok response with empty results if sitemaps were processed but empty
+          return Ok(CompareDomainsResponse {
+                domain_a: domain_a.clone(),
+                domain_b: domain_b.clone(),
                 similar_pages: vec![],
                 domain_a_processing_errors: vec![],
                 domain_b_processing_errors: vec![],
-            })).into_response();
+          });
      }
 
     // --- Fetch and Process Pages Concurrently ---
-    let fetch_process_span_a = tracing::info_span!("fetch_process_embed_pages", domain = %request.domain_a);
+    let fetch_process_span_a = tracing::info_span!("fetch_process_embed_pages", domain = %domain_a);
     let embedder_a = embedder.clone();
     let client_a = client.clone();
     let futures_a = urls_a.into_iter().map(|url| {
@@ -1626,7 +1741,7 @@ async fn compare_domain_pages(
     });
     let results_a = join_all(futures_a).instrument(fetch_process_span_a).await;
 
-    let fetch_process_span_b = tracing::info_span!("fetch_process_embed_pages", domain = %request.domain_b);
+    let fetch_process_span_b = tracing::info_span!("fetch_process_embed_pages", domain = %domain_b);
     let embedder_b = embedder.clone();
     let client_b = client.clone();
     let futures_b = urls_b.into_iter().map(|url| {
@@ -1692,7 +1807,7 @@ async fn compare_domain_pages(
     let comparison_span = tracing::info_span!("compare_embeddings_all");
     {
         let _enter = comparison_span.enter();
-        let semantic_threshold = request.similarity_threshold;
+        let semantic_threshold = similarity_threshold; // Use the parameter directly
         const TYPE_MATCH_BONUS: f64 = 0.1; // Bonus for matching types (tune as needed)
 
         tracing::info!(
@@ -1756,7 +1871,7 @@ async fn compare_domain_pages(
         } // End outer loop (pages_a)
     } // End comparison scope
 
-    tracing::info!("Found {} similar page pairs above threshold {}", similar_pairs.len(), request.similarity_threshold);
+    tracing::info!("Found {} similar page pairs above threshold {}", similar_pairs.len(), similarity_threshold);
 
     // ---> Calculate and Log Performance Metrics <---
     let total_duration = start_time.elapsed();
@@ -1776,13 +1891,13 @@ async fn compare_domain_pages(
     );
 
     // --- Return Response ---
-    (StatusCode::OK, Json(CompareDomainsResponse {
-        domain_a: request.domain_a,
-        domain_b: request.domain_b,
+    Ok(CompareDomainsResponse {
+        domain_a: domain_a.clone(), // Clone domains for the response
+        domain_b: domain_b.clone(),
         similar_pages: similar_pairs,
         domain_a_processing_errors: errors_a,
         domain_b_processing_errors: errors_b,
-    })).into_response()
+    })
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -2044,19 +2159,19 @@ pub struct NewPagesQuery {
     domains: Vec<String>,
     /// Optional: Set to true to include the list of new page URLs and details in the response for each domain. Defaults to false.
     #[serde(default)]
-    #[param(required = false)] // Add this attribute for query parameters
+    // #[param(required = false)] // REMOVE this attribute
     list_pages: Option<bool>,
     /// Optional: Number of days in the past to check for newly created pages. Defaults to 30.
     #[serde(default = "default_within_days_new")]
-    #[param(required = false)] // Add this attribute for query parameters
+    // #[param(required = false)] // REMOVE this attribute
     within_days: u32,
     /// Optional webhook URL to send the result to when the job is complete
     #[serde(default)]
-    #[param(required = false)]
+    #[param(required = false)] // Keep this one for webhook_url
     webhook_url: Option<String>,
     /// Optional flag to control whether to send results to the webhook (default: true)
     #[serde(default = "default_send_results")]
-    #[param(required = false)]
+    #[param(required = false)] // Keep this one for send_results
     send_results: bool,
 }
 
@@ -2719,7 +2834,7 @@ async fn analyze_single_domain_for_new_pages(
 // --- END EDIT ---
 
 // In analyze_multiple_domains_for_new_pages function:
-pub async fn analyze_multiple_domains_for_new_pages(
+async fn analyze_multiple_domains_for_new_pages(
     State(state): State<AppState>,
     Json(query): Json<NewPagesQuery>
 ) -> Result<Json<Vec<NewPagesResponse>>, AppError> {
@@ -2785,4 +2900,35 @@ pub async fn analyze_multiple_domains_for_new_pages(
     );
 
     Ok(Json(results))
+}
+
+// src/lib.rs - Add this function somewhere before create_app
+async fn api_key_auth(
+    State(state): State<AppState>, // Extract the whole AppState
+    req: Request,
+    next: Next,
+) -> Result<Response, impl IntoResponse> { // Return impl IntoResponse for error case
+    let provided_key = req.headers()
+        .get("X-API-Key") // Common header for API keys
+        .and_then(|value| value.to_str().ok());
+
+    match provided_key {
+        Some(key) if state.api_keys.contains(key) => {
+            // Key is valid, proceed to the next middleware or handler
+            tracing::trace!("Valid API key provided.");
+            Ok(next.run(req).await)
+        }
+        Some(_) => {
+            // Key was provided but it's invalid
+            tracing::warn!("Invalid API key provided.");
+            // Return a clear error response
+            Err((StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "Invalid API Key"}))))
+        }
+        None => {
+            // No key was provided
+            tracing::warn!("Missing API key.");
+            // Return a clear error response
+            Err((StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "API Key required"}))))
+        }
+    }
 }

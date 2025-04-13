@@ -1,0 +1,65 @@
+---
+description: 
+globs: 
+alwaysApply: false
+---
+# API Key Authentication Middleware
+
+This document explains how to protect API routes using the implemented API key authentication middleware.
+
+## Overview
+
+The API uses a simple API key mechanism to restrict access to certain endpoints. Valid API keys are stored in the environment and checked by a middleware function.
+
+## Configuration
+
+1.  **Define Keys:** API keys are defined in the `.env` file at the project root. Add a comma-separated list of valid keys to the `API_KEYS` variable:
+    ```dotenv
+    # .env
+    API_KEYS="key1_abc,key2_xyz,another_valid_key"
+    # Other variables...
+    ```
+    **Note:** Add `.env` to your `.gitignore` file. Storing secrets directly in `.env` is suitable for development/MVP but **not recommended for production**. Use a proper secrets management solution for production deployments.
+
+2.  **Loading:** The `create_app` function in `src/lib.rs` uses the `dotenvy` crate to load these keys from the environment variable `API_KEYS` at startup. They are stored in a `HashSet` within the `AppState` for efficient checking.
+
+## Middleware Function
+
+The core logic resides in the `api_key_auth` async function (`src/lib.rs`). This function:
+*   Expects the client to send the API key in the `X-API-Key` HTTP header.
+*   Retrieves the `AppState` containing the set of valid keys.
+*   Compares the provided key from the header against the valid keys.
+*   If the key is valid, the request is passed to the next handler/middleware.
+*   If the key is missing or invalid, it returns an `HTTP 401 Unauthorized` response with a JSON error message.
+
+## Applying the Middleware
+
+To protect a route or a group of routes:
+
+1.  **Group Routes:** Define the routes you want to protect within their own `axum::Router`.
+2.  **Apply Layer:** Use the `.route_layer()` method on the router group, passing the `api_key_auth` middleware function using `axum::middleware::from_fn_with_state`.
+
+**Example (from `src/lib.rs` `create_app`):**
+
+```rust
+    // --- Define protected API routes ---
+    let protected_api_routes = Router::new()
+        .route("/research/pages/updated", get(research_pages))
+        .route("/research/crawl", post(crawl_domains))
+        // ... other protected routes
+        // Apply the authentication middleware to this group
+        .route_layer(axum::middleware::from_fn_with_state(app_state.clone(), api_key_auth));
+
+    // --- Define public routes (no auth needed) ---
+    let public_routes = Router::new()
+        .route("/health", get(health_check));
+        // ... other public routes
+
+    // --- Build the final application router ---
+    let app = Router::new()
+        .merge(public_routes)       // Public routes don't need the layer
+        .merge(protected_api_routes) // Protected routes get the auth middleware
+        .with_state(app_state);
+```
+
+This ensures that any request to `/research/*` must include a valid `X-API-Key` header, while requests to `/health` remain public. 

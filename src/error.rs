@@ -13,16 +13,20 @@ pub enum AppError {
     ProcessingError(String),
     InvalidRequest(String),
     SerializationError(String),
+    UnprocessableEntity(String),
+    InternalError(String),
 }
 
 impl fmt::Display for AppError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             AppError::SitemapNotFound(domain) => write!(f, "Sitemap not found for domain: {}", domain),
-            AppError::SitemapFetchError(msg) => write!(f, "Error fetching sitemap: {}", msg),
+            AppError::SitemapFetchError(msg) => write!(f, "Error fetching/processing sitemap: {}", msg),
             AppError::ProcessingError(msg) => write!(f, "Processing error: {}", msg),
             AppError::InvalidRequest(msg) => write!(f, "Invalid request: {}", msg),
             AppError::SerializationError(msg) => write!(f, "Serialization error: {}", msg),
+            AppError::UnprocessableEntity(msg) => write!(f, "Unprocessable Entity: {}", msg),
+            AppError::InternalError(msg) => write!(f, "Internal Server Error: {}", msg),
         }
     }
 }
@@ -40,10 +44,12 @@ impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let (status, error_message) = match &self {
             AppError::SitemapNotFound(_) => (StatusCode::UNPROCESSABLE_ENTITY, self.to_string()),
+            AppError::InvalidRequest(_) => (StatusCode::BAD_REQUEST, self.to_string()),
+            AppError::UnprocessableEntity(_) => (StatusCode::UNPROCESSABLE_ENTITY, self.to_string()),
             AppError::SitemapFetchError(_) => (StatusCode::INTERNAL_SERVER_ERROR, self.to_string()),
             AppError::ProcessingError(_) => (StatusCode::INTERNAL_SERVER_ERROR, self.to_string()),
-            AppError::InvalidRequest(_) => (StatusCode::UNPROCESSABLE_ENTITY, self.to_string()),
             AppError::SerializationError(_) => (StatusCode::INTERNAL_SERVER_ERROR, self.to_string()),
+            AppError::InternalError(_) => (StatusCode::INTERNAL_SERVER_ERROR, self.to_string()),
         };
 
         let body = Json(json!({

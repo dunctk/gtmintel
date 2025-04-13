@@ -2032,6 +2032,7 @@ dependencies = [
  "axum",
  "backoff",
  "chrono",
+ "dotenvy",
  "embed_anything",
  "fast_html2md",
  "futures",
