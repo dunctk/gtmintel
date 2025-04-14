@@ -667,20 +667,41 @@ async fn process_async_webhook_request<F, Fut, T>(
 // --- End Webhook utility functions ---
 
 pub fn create_app() -> Router {
-    // --- Load API Keys from .env ---
-    dotenvy::dotenv().expect("Failed to load .env file. Create one with API_KEYS variable.");
-    let keys_str = env::var("API_KEYS").expect("API_KEYS must be set in .env (comma-separated)");
-    let api_keys: HashSet<String> = keys_str.split(',')
-                                        .map(|s| s.trim().to_string())
-                                        .filter(|s| !s.is_empty()) // Avoid empty keys if there are trailing commas
-                                        .collect();
-    if api_keys.is_empty() {
-        panic!("No valid API_KEYS found in .env file.");
+    // --- Load API Keys ---
+    let api_keys: HashSet<String> = match std::env::var("API_KEYS") {
+        Ok(keys_str) => {
+            tracing::info!("Loading API keys from environment variable");
+            keys_str
+        }
+        Err(_) => {
+            tracing::info!("API_KEYS not found in environment, trying .env file");
+            match dotenvy::dotenv() {
+                Ok(_) => match std::env::var("API_KEYS") {
+                    Ok(keys) => keys,
+                    Err(_) => {
+                        tracing::error!("API_KEYS not found in .env file");
+                        panic!("API_KEYS must be set in environment or .env file");
+                    }
+                },
+                Err(e) => {
+                    tracing::error!("Failed to load .env file: {}", e);
+                    panic!("API_KEYS must be set in environment or .env file");
+                }
+            }
+        }
     }
+    .split(',')
+    .map(|s| s.trim().to_string())
+    .filter(|s| !s.is_empty()) // Avoid empty keys if there are trailing commas
+    .collect();
+
+    if api_keys.is_empty() {
+        panic!("No valid API keys found. API_KEYS must contain at least one non-empty key");
+    }
+
     let shared_api_keys = Arc::new(api_keys);
     tracing::info!("Loaded {} API key(s)", shared_api_keys.len());
     // --- End API Key Loading ---
-
 
     let api_doc = ApiDoc::openapi();
     let shared_embedder = TEXT_EMBEDDER.clone();
