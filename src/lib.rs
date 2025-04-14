@@ -1,5 +1,6 @@
 // Add this line at the top of your lib.rs file, before any imports
 pub mod error;
+pub mod routes; // Add the routes module
 
 // Then your existing imports can stay as they are
 use axum::{
@@ -542,7 +543,8 @@ async fn health_check() -> impl IntoResponse {
         crawl_domains,
         compare_domain_pages,
         research_new_pages,
-        research_new_pages_batch // Ensure batch endpoint is listed
+        research_new_pages_batch, // Ensure batch endpoint is listed
+        routes::content_suggestions::get_content_suggestions // Add our new content suggestions route
     ),
     components(schemas(
         ResearchQuery,
@@ -559,7 +561,11 @@ async fn health_check() -> impl IntoResponse {
         NewPageDetail,
         DetectionMethod,
         WebhookRequest,         // Generic webhook fields
-        WebhookAcceptedResponse // Standard accepted response
+        WebhookAcceptedResponse, // Standard accepted response
+        routes::content_suggestions::SuggestionResponse, // Add our content suggestion models
+        routes::content_suggestions::Suggestion,
+        routes::content_suggestions::Correction,
+        routes::content_suggestions::ContentSuggestionsQuery
     ))
 )]
 struct ApiDoc;
@@ -720,6 +726,7 @@ pub fn create_app() -> Router {
         .route("/research/crawl", post(crawl_domains))
         .route("/research/similar-pages", post(compare_domain_pages))
         .route("/research/pages/new/batch", post(research_new_pages_batch))
+        .route("/research/content-suggestions", get(routes::content_suggestions::get_content_suggestions)) // Add our new route
         // Apply the authentication middleware to this group
         .route_layer(axum::middleware::from_fn_with_state(app_state.clone(), api_key_auth));
 
