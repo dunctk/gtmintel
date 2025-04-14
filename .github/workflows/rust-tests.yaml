@@ -14,7 +14,7 @@ jobs:
         run: cargo test --all-features
         env:
           RUSTFLAGS: "-A warnings"  # Allow all warnings
-          API_KEYS="9d46051ecc5e55b1bdafd4c4299319a34748af45bd01ca7738a39eb1b4384a9b,e4d9bffc6acf9bd9f3c1511032dc5cabb783bc723092a344b43d50aabca2135d"
+          API_KEYS: "9d46051ecc5e55b1bdafd4c4299319a34748af45bd01ca7738a39eb1b4384a9b,e4d9bffc6acf9bd9f3c1511032dc5cabb783bc723092a344b43d50aabca2135d"
 
   # Check formatting with rustfmt
   #formatting:
