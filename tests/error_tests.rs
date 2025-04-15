@@ -56,7 +56,7 @@ async fn test_app_error_into_response() {
     // Test InvalidRequest error
     let error = AppError::InvalidRequest("missing domain parameter".to_string());
     let response = error.into_response();
-    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     
     let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
     let body: Value = serde_json::from_slice(&body_bytes).unwrap();

@@ -21,7 +21,7 @@ impl fmt::Display for AppError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             AppError::SitemapNotFound(domain) => write!(f, "Sitemap not found for domain: {}", domain),
-            AppError::SitemapFetchError(msg) => write!(f, "Error fetching/processing sitemap: {}", msg),
+            AppError::SitemapFetchError(msg) => write!(f, "Error fetching sitemap: {}", msg),
             AppError::ProcessingError(msg) => write!(f, "Processing error: {}", msg),
             AppError::InvalidRequest(msg) => write!(f, "Invalid request: {}", msg),
             AppError::SerializationError(msg) => write!(f, "Serialization error: {}", msg),
