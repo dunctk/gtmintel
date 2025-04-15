@@ -544,6 +544,7 @@ async fn health_check() -> impl IntoResponse {
         compare_domain_pages,
         research_new_pages,
         research_new_pages_batch, // Ensure batch endpoint is listed
+        routes::content_suggestions::get_content_suggestions, // Add our new content suggestions route
         routes::content_suggestions::get_content_suggestions // Add our new content suggestions route
     ),
     components(schemas(
@@ -728,7 +729,8 @@ pub fn create_app() -> Router {
         .route("/research/pages/new/batch", post(research_new_pages_batch))
         .route("/research/content-suggestions", get(routes::content_suggestions::get_content_suggestions)) // Add our new route
         // Apply the authentication middleware to this group
-        .route_layer(axum::middleware::from_fn_with_state(app_state.clone(), api_key_auth));
+        .route_layer(axum::middleware::from_fn_with_state(app_state.clone(), api_key_auth))
+        .route("/research/pages/new", get(research_new_pages));
 
     // --- Define public routes (no auth needed) ---
     let public_routes = Router::new()
