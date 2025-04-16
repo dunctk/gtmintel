@@ -533,6 +533,7 @@ async fn health_check() -> impl IntoResponse {
     info(
         title = "GTM INTEL API",
         version = "0.0.1",
+        description = "[✨ Use the hosted API on RapidAPI](https://rapidapi.com/dunctk/api/gtm-intel7)\n\nThis API provides endpoints for company research and website analysis. See the [README](https://github.com/dunctk/gtmintel) for more info.",
         license(
             name = "Sustainable Use License",
             url = "https://github.com/dunctk/gtmintel/blob/main/LICENSE.md"

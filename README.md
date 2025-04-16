@@ -1,9 +1,13 @@
+<p align="left">
+  <img src="img/gtmintel_logo03.png" alt="GTM Intel Logo" width="120" />
+</p>
+
 # GTM INTEL API
 [![Actions Status](https://github.com/dunctk/gtmintel/workflows/Rust_Tests/badge.svg)](https://github.com/dunctk/gtmintel/actions)
  [![Codecov](https://codecov.io/gh/dunctk/gtmintel//branch/main/graph/badge.svg)](https://codecov.io/gh/dunctk/gtmintel)
 
 
-[**API Docs**](https://api.gtmintel.com/docs/) | [**OpenAPI Specification (JSON)**](https://api.gtmintel.com/api-doc/openapi.json)
+[**✨ Use the hosted API**](https://rapidapi.com/dunctk/api/gtm-intel7) | [**API Docs**](https://api.gtmintel.com/docs/) | [**OpenAPI Specification (JSON)**](https://api.gtmintel.com/api-doc/openapi.json)
 
 API for [GTM INTEL](https://gtmintel.com)
 
@@ -188,3 +192,6 @@ I want to:
 3. Be clear about what use is permitted
 
 If you have any questions about licensing or permitted use cases, please contact us. 
+
+
+### [✨ Use the hosted API](https://rapidapi.com/dunctk/api/gtm-intel7)
