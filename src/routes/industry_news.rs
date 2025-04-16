@@ -40,7 +40,17 @@ pub struct NewsResponse {
 }
 
 pub fn load_feeds() -> Result<Vec<Feed>, std::io::Error> {
-    let file = std::fs::File::open("/app/data/feeds_ai.json")?;
+    let path = if cfg!(debug_assertions) {
+        // Use local path for development/test builds
+        "src/data/feeds_ai.json"
+    } else {
+        // Use container path for release builds (Docker)
+        "/app/data/feeds_ai.json"
+    };
+    
+    println!("Attempting to load feeds from: {}", path); // Add logging
+
+    let file = std::fs::File::open(path)?;
     let feeds: Vec<Feed> = serde_json::from_reader(file)?;
     Ok(feeds)
 }
