@@ -1,0 +1,179 @@
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum Vertical {
+    Ai,
+    Fintech,
+    Biotech,
+    Healthtech,
+    Robotics,
+    Other(String), // fallback if needed
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct Feed {
+    name: String,
+    description: String,
+    rss: String,
+    vertical: Vertical,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct NewsItem {
+    /// Title of the news item
+    pub title: String,
+    /// URL to the full article
+    pub link: String,
+    /// Publication date in RFC2822 format
+    pub published: String,
+    /// Optional description or excerpt of the article
+    pub description: Option<String>,
+    /// Name of the source publication
+    pub source: String,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct NewsResponse {
+    /// List of news items
+    pub items: Vec<NewsItem>,
+    /// Number of days the news items span
+    pub days: u32,
+}
+
+pub fn load_ai_feeds() -> Result<Vec<Feed>, std::io::Error> {
+    let file = std::fs::File::open("src/data/feeds_ai.json")?;
+    let feeds: Vec<Feed> = serde_json::from_reader(file)?;
+    Ok(feeds)
+}
+
+use axum::{
+    extract::{Query, State},
+    http::StatusCode,
+    response::IntoResponse,
+    Json,
+};
+use http_cache_reqwest::{Cache, CacheMode, HttpCache, HttpCacheOptions, CACacheManager};
+use reqwest::Client;
+use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
+use rss::Channel;
+use chrono::{DateTime, Utc, Duration};
+use serde::Deserialize;
+use std::error::Error;
+use utoipa::{ToSchema, IntoParams};
+use crate::AppState;
+
+#[derive(Debug, Deserialize, ToSchema, IntoParams)]
+pub struct NewsQuery {
+    /// Number of days to look back for news items (default: 7)
+    #[serde(default = "default_days")]
+    days: u32,
+}
+
+fn default_days() -> u32 {
+    7
+}
+
+/// Retrieve recent industry news from AI-related RSS feeds
+#[utoipa::path(
+    get,
+    path = "/industry/news",
+    params(NewsQuery),
+    responses(
+        (status = 200, description = "Successfully retrieved news items", body = NewsResponse),
+        (status = 500, description = "Failed to fetch news", body = NewsResponse)
+    ),
+    description = "Fetches recent industry news from various AI-related sources. News items are filtered by date and sorted with newest first."
+)]
+pub async fn fetch_industry_news(
+    Query(query): Query<NewsQuery>,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    match get_news_from_feeds(query.days, state.http_client).await {
+        Ok(items) => (
+            StatusCode::OK,
+            Json(NewsResponse {
+                items,
+                days: query.days,
+            }),
+        ),
+        Err(e) => {
+            eprintln!("Error fetching news feeds: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(NewsResponse {
+                    items: vec![],
+                    days: query.days,
+                }),
+            )
+        },
+    }
+}
+
+async fn get_news_from_feeds(days: u32, client: ClientWithMiddleware) -> Result<Vec<NewsItem>, Box<dyn Error + Send + Sync>> {
+    let feeds = load_ai_feeds().map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
+    let cutoff_date = Utc::now() - Duration::days(days as i64);
+    
+    let mut all_items = Vec::new();
+    
+    for feed in feeds {
+        match fetch_and_parse_feed(&feed, &client).await {
+            Ok(mut items) => {
+                // Filter items by date
+                items.retain(|item| {
+                    if let Ok(date) = DateTime::parse_from_rfc2822(&item.published) {
+                        date.with_timezone(&Utc) >= cutoff_date
+                    } else {
+                        false // Skip items that don't have a valid date
+                    }
+                });
+                
+                all_items.extend(items);
+            }
+            Err(e) => {
+                eprintln!("Error fetching feed {}: {}", feed.name, e);
+                // Continue with other feeds
+            }
+        }
+    }
+    
+    // Sort by published date, newest first
+    all_items.sort_by(|a, b| {
+        let date_a = DateTime::parse_from_rfc2822(&a.published).unwrap_or_default();
+        let date_b = DateTime::parse_from_rfc2822(&b.published).unwrap_or_default();
+        date_b.cmp(&date_a)
+    });
+    
+    Ok(all_items)
+}
+
+async fn fetch_and_parse_feed(feed: &Feed, client: &ClientWithMiddleware) -> Result<Vec<NewsItem>, Box<dyn Error + Send + Sync>> {
+    let response = client.get(&feed.rss).send().await?;
+    let content = response.bytes().await?;
+    
+    let channel = Channel::read_from(&content[..])?;
+    
+    let items = channel.items().iter().map(|item| {
+        NewsItem {
+            title: item.title().unwrap_or("Untitled").to_string(),
+            link: item.link().unwrap_or("").to_string(),
+            published: item.pub_date().unwrap_or("").to_string(),
+            description: item.description().map(|s| s.to_string()),
+            source: feed.name.clone(),
+        }
+    }).collect();
+    
+    Ok(items)
+}
+
+// Helper function to create a cached HTTP client
+pub fn create_cached_client() -> ClientWithMiddleware {
+    let client = Client::new();
+    
+    ClientBuilder::new(client)
+        .with(Cache(HttpCache {
+            mode: CacheMode::Default,
+            manager: CACacheManager::default(),
+            options: HttpCacheOptions::default(),
+        }))
+        .build()
+}
+

@@ -1,0 +1,14 @@
+[
+    {
+        "name": "404 Media",
+        "description": "404 Media is a new independent media company founded by technology journalists Jason Koebler, Emanuel Maiberg, Samantha Cole, and Joseph …",
+        "rss": "https://www.404media.co/rss",
+        "vertical": "ai"
+    },
+    {
+        "name": "Ahead of AI",
+        "description": "Ahead AI specializes in Machine Learning & AI research and is read by more than 42,000 researchers and practitioners (across …",
+        "rss": "https://magazine.sebastianraschka.com/feed",
+        "vertical": "ai"
+    }
+]

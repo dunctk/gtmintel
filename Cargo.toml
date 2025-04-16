@@ -40,6 +40,7 @@ http-cache-reqwest = "0.15.1"
 reqwest-middleware = "0.4.2"
 ua_generator = "0.5.11"
 dotenvy = "0.15.7"
+rss = "2.0.7"
 
 
 [dev-dependencies]

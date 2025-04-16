@@ -546,6 +546,7 @@ async fn health_check() -> impl IntoResponse {
         research_new_pages,
         research_new_pages_batch, // Ensure batch endpoint is listed
         routes::content_suggestions::get_content_suggestions, // Add our new content suggestions route
+        routes::industry_news::fetch_industry_news, // Add the industry news route
     ),
     components(schemas(
         ResearchQuery,
@@ -567,7 +568,10 @@ async fn health_check() -> impl IntoResponse {
         routes::content_suggestions::SuggestionResponse, // Add our content suggestion models
         routes::content_suggestions::Suggestion,
         routes::content_suggestions::Correction,
-        routes::content_suggestions::ContentSuggestionsQuery
+        routes::content_suggestions::ContentSuggestionsQuery,
+        routes::industry_news::NewsItem,
+        routes::industry_news::NewsResponse,
+        routes::industry_news::NewsQuery
     ))
 )]
 struct ApiDoc;
@@ -764,6 +768,7 @@ pub fn create_app() -> Router {
     // --- Define public routes (no auth needed) ---
     let public_routes = Router::new()
         .route("/health", get(health_check))
+        .route("/industry/news", get(routes::industry_news::fetch_industry_news)) // Add the industry news route
         .route("/", get(|| async { Redirect::temporary("/docs") })); // Root redirect
 
     // --- Conditionally apply layers and Swagger UI only when NOT running tests ---
