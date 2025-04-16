@@ -3,6 +3,9 @@
 </p>
 
 # GTM INTEL API
+
+Go To Market Intelligence
+
 [![Actions Status](https://github.com/dunctk/gtmintel/workflows/Rust_Tests/badge.svg)](https://github.com/dunctk/gtmintel/actions)
  [![Codecov](https://codecov.io/gh/dunctk/gtmintel//branch/main/graph/badge.svg)](https://codecov.io/gh/dunctk/gtmintel)
 
