@@ -1,14 +1,176 @@
 [
-    {
-        "name": "404 Media",
-        "description": "404 Media is a new independent media company founded by technology journalists Jason Koebler, Emanuel Maiberg, Samantha Cole, and Joseph …",
-        "rss": "https://www.404media.co/rss",
-        "vertical": "ai"
-    },
-    {
-        "name": "Ahead of AI",
-        "description": "Ahead AI specializes in Machine Learning & AI research and is read by more than 42,000 researchers and practitioners (across …",
-        "rss": "https://magazine.sebastianraschka.com/feed",
-        "vertical": "ai"
-    }
+  {
+    "name": "404 Media",
+    "description": "404 Media is a new independent media company founded by technology journalists Jason Koebler, Emanuel Maiberg, Samantha Cole, and Joseph \u2026",
+    "rss": "https://www.404media.co/rss",
+    "vertical": "ai"
+  },
+  {
+    "name": "Ahead of AI",
+    "description": "Ahead AI specializes in Machine Learning & AI research and is read by more than 42,000 researchers and practitioners (across \u2026",
+    "rss": "https://magazine.sebastianraschka.com/feed",
+    "vertical": "ai"
+  },
+  {
+    "name": "AI Accelerator Institute | Future of Artificial Intelligence",
+    "description": "Next Generation Machine Intelligence",
+    "rss": "https://aiacceleratorinstitute.com/rss/",
+    "vertical": "ai"
+  },
+  {
+    "name": "AI \u2013 AI-TechPark",
+    "description": "AI, ML, IoT, Cybersecurity News & Trend Analysis, Interviews",
+    "rss": "https://ai-techpark.com/category/ai/feed/",
+    "vertical": "ai"
+  },
+  {
+    "name": "AI Archives | KnowTechie",
+    "description": "Tech News, Reviews, and How-To's for the Non-Techie",
+    "rss": "https://knowtechie.com/category/ai/feed/",
+    "vertical": "ai"
+  },
+  {
+    "name": "AI Business",
+    "description": "AI Business - informing, educating, and connecting the global AI community.",
+    "rss": "https://aibusiness.com/rss.xml",
+    "vertical": "ai"
+  },
+  {
+    "name": "AIModels.fyi",
+    "description": "Get a digest of new AI research, how-to guides, and top models.",
+    "rss": "https://aimodels.substack.com/feed",
+    "vertical": "ai"
+  },
+  {
+    "name": "AI News",
+    "description": "Artificial Intelligence News",
+    "rss": "https://www.artificialintelligence-news.com/feed/rss/",
+    "vertical": "ai"
+  },
+  {
+    "name": "AI News | VentureBeat",
+    "description": "Transformative tech coverage that matters",
+    "rss": "https://venturebeat.com/category/ai/feed/",
+    "vertical": "ai"
+  },
+  {
+    "name": "AI Now Institute",
+    "description": "The AI Now Institute produces diagnosis and actionable policy research on artificial intelligence.",
+    "rss": "https://ainowinstitute.org/category/news/feed",
+    "vertical": "ai"
+  },
+  {
+    "name": "Ai Prompt Programming",
+    "description": "This group focuses on using AI tools like ChatGPT, OpenAI API, and other automated code generators for Ai programming & \u2026",
+    "rss": "https://www.reddit.com/r/aipromptprogramming",
+    "vertical": "ai"
+  },
+  {
+    "name": "AI \u2013 SiliconANGLE",
+    "description": "Extracting the signal from the noise.",
+    "rss": "https://siliconangle.com/category/ai/feed",
+    "vertical": "ai"
+  },
+  {
+    "name": "AI Snake Oil",
+    "description": "What AI can't do",
+    "rss": "https://aisnakeoil.substack.com/feed",
+    "vertical": "ai"
+  },
+  {
+    "name": "AI \u2013 Uber Engineering Blog",
+    "description": "Software engineering and technologies that set the world in motion",
+    "rss": "https://eng.uber.com/category/articles/ai/feed",
+    "vertical": "ai"
+  },
+  {
+    "name": "Analytics India Magazine",
+    "description": "Artificial Intelligence, Emerging Tech, Data Science",
+    "rss": "https://analyticsindiamag.com/feed/",
+    "vertical": "ai"
+  },
+  {
+    "name": "Artificial Intelligence - Reddit",
+    "description": "Reddit's home for Artificial Intelligence",
+    "rss": "https://www.reddit.com/r/artificial",
+    "vertical": "ai"
+  },
+  {
+    "name": "Artificial intelligence (AI) \u2013 The Conversation",
+    "description": "Latest articles on AI from The Conversation",
+    "rss": "https://theconversation.com/europe/topics/artificial-intelligence-ai-90/articles.atom",
+    "vertical": "ai"
+  },
+  {
+    "name": "Artificial intelligence (AI) | The Guardian",
+    "description": "Latest news and features from theguardian.com",
+    "rss": "https://www.theguardian.com/technology/artificialintelligenceai/rss",
+    "vertical": "ai"
+  },
+  {
+    "name": "Artificial Intelligence \u2013 Futurism",
+    "description": "Building the future together",
+    "rss": "https://futurism.com/categories/ai-artificial-intelligence/feed",
+    "vertical": "ai"
+  },
+  {
+    "name": "Artificial Intelligence Latest - Wired",
+    "description": "Latest content on AI from Wired",
+    "rss": "https://www.wired.com/feed/tag/ai/latest/rss",
+    "vertical": "ai"
+  },
+  {
+    "name": "Artificial Intelligence News -- ScienceDaily",
+    "description": "Futuristic robots, AI models, and more.",
+    "rss": "https://www.sciencedaily.com/rss/computers_math/artificial_intelligence.xml",
+    "vertical": "ai"
+  },
+  {
+    "name": "Artificial Intelligence | TechRepublic",
+    "description": "News, Tips, and Advice for Technology Professionals",
+    "rss": "https://www.techrepublic.com/rssfeeds/topic/artificial-intelligence/",
+    "vertical": "ai"
+  },
+  {
+    "name": "Blog - PyImageSearch",
+    "description": "Master Computer Vision, Deep Learning, and OpenCV",
+    "rss": "https://pyimagesearch.com/blog/feed",
+    "vertical": "ai"
+  },
+  {
+    "name": "DeepMind Blog",
+    "description": "Latest articles and breakthroughs from DeepMind",
+    "rss": "https://deepmind.com/blog/feed/basic/",
+    "vertical": "ai"
+  },
+  {
+    "name": "Hugging Face - Blog",
+    "description": "The Hugging Face blog",
+    "rss": "https://huggingface.co/blog/feed.xml",
+    "vertical": "ai"
+  },
+  {
+    "name": "OpenAI Blog",
+    "description": "The OpenAI blog",
+    "rss": "https://openai.com/blog/rss/",
+    "vertical": "ai"
+  },
+  {
+    "name": "Weights & Biases: Fully Connected",
+    "description": "Curated tutorials, research, and industry insights",
+    "rss": "https://wandb.ai/fully-connected/rss.xml",
+    "vertical": "ai"
+  },
+  {
+    "name": "The Rundown AI",
+    "description": "Latest developments in AI",
+    "rss": "https://rss.beehiiv.com/feeds/2R3C6Bt5wj.xml",
+    "vertical": "ai"
+  },
+  {
+    "name": "Last Week in AI",
+    "description": "Weekly AI summaries and commentary",
+    "rss": "https://lastweekin.ai/feed",
+    "vertical": "ai"
+  }
 ]

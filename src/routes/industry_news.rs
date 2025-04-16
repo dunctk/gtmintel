@@ -1,4 +1,4 @@
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, serde::Serialize, serde::Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 enum Vertical {
     Ai,
@@ -10,7 +10,7 @@ enum Vertical {
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
-struct Feed {
+pub struct Feed {
     name: String,
     description: String,
     rss: String,
@@ -39,7 +39,7 @@ pub struct NewsResponse {
     pub days: u32,
 }
 
-pub fn load_ai_feeds() -> Result<Vec<Feed>, std::io::Error> {
+pub fn load_feeds() -> Result<Vec<Feed>, std::io::Error> {
     let file = std::fs::File::open("src/data/feeds_ai.json")?;
     let feeds: Vec<Feed> = serde_json::from_reader(file)?;
     Ok(feeds)
@@ -66,10 +66,17 @@ pub struct NewsQuery {
     /// Number of days to look back for news items (default: 7)
     #[serde(default = "default_days")]
     days: u32,
+    /// Industry vertical to fetch news for (default: ai)
+    #[serde(default = "default_vertical")]
+    vertical: String,
 }
 
 fn default_days() -> u32 {
     7
+}
+
+fn default_vertical() -> String {
+    "ai".to_string()
 }
 
 /// Retrieve recent industry news from AI-related RSS feeds
@@ -87,7 +94,7 @@ pub async fn fetch_industry_news(
     Query(query): Query<NewsQuery>,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
-    match get_news_from_feeds(query.days, state.http_client).await {
+    match get_news_from_feeds(query.days, query.vertical, state.http_client).await {
         Ok(items) => (
             StatusCode::OK,
             Json(NewsResponse {
@@ -108,21 +115,42 @@ pub async fn fetch_industry_news(
     }
 }
 
-async fn get_news_from_feeds(days: u32, client: ClientWithMiddleware) -> Result<Vec<NewsItem>, Box<dyn Error + Send + Sync>> {
-    let feeds = load_ai_feeds().map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
+async fn get_news_from_feeds(days: u32, vertical: String, client: ClientWithMiddleware) -> Result<Vec<NewsItem>, Box<dyn Error + Send + Sync>> {
+    let all_feeds = load_feeds().map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
     let cutoff_date = Utc::now() - Duration::days(days as i64);
+    
+    // Filter feeds by the requested vertical (case-insensitive comparison)
+    let vertical_lower = vertical.to_lowercase();
+    let filtered_feeds: Vec<&Feed> = all_feeds.iter().filter(|feed| {
+        match &feed.vertical {
+            Vertical::Ai => vertical_lower == "ai",
+            Vertical::Fintech => vertical_lower == "fintech",
+            Vertical::Biotech => vertical_lower == "biotech",
+            Vertical::Healthtech => vertical_lower == "healthtech",
+            Vertical::Robotics => vertical_lower == "robotics",
+            Vertical::Other(s) => vertical_lower == s.to_lowercase(),
+        }
+    }).collect();
+
+    if filtered_feeds.is_empty() {
+        eprintln!("No feeds found for vertical: {}", vertical);
+        return Ok(Vec::new()); // Return empty list if no feeds match
+    }
     
     let mut all_items = Vec::new();
     
-    for feed in feeds {
+    // Iterate over the *filtered* feeds
+    for feed in filtered_feeds {
         match fetch_and_parse_feed(&feed, &client).await {
             Ok(mut items) => {
                 // Filter items by date
                 items.retain(|item| {
-                    if let Ok(date) = DateTime::parse_from_rfc2822(&item.published) {
+                    // Attempt to parse the date
+                    if let Ok(date) = DateTime::parse_from_rfc2822(&item.published).or_else(|_| DateTime::parse_from_rfc3339(&item.published)) {
                         date.with_timezone(&Utc) >= cutoff_date
                     } else {
-                        false // Skip items that don't have a valid date
+                        eprintln!("Could not parse date: {} for feed {}", item.published, feed.name);
+                        false // Skip items with unparseable dates
                     }
                 });
                 
@@ -137,8 +165,8 @@ async fn get_news_from_feeds(days: u32, client: ClientWithMiddleware) -> Result<
     
     // Sort by published date, newest first
     all_items.sort_by(|a, b| {
-        let date_a = DateTime::parse_from_rfc2822(&a.published).unwrap_or_default();
-        let date_b = DateTime::parse_from_rfc2822(&b.published).unwrap_or_default();
+        let date_a = DateTime::parse_from_rfc2822(&a.published).or_else(|_| DateTime::parse_from_rfc3339(&a.published)).unwrap_or_default();
+        let date_b = DateTime::parse_from_rfc2822(&b.published).or_else(|_| DateTime::parse_from_rfc3339(&b.published)).unwrap_or_default();
         date_b.cmp(&date_a)
     });
     

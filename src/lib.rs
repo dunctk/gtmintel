@@ -98,7 +98,7 @@ static HTTP_CLIENT: Lazy<ClientWithMiddleware> = Lazy::new(|| {
 
 // --- Define AppState AFTER TEXT_EMBEDDER and HTTP_CLIENT, but BEFORE functions ---
 #[derive(Clone)]
-struct AppState {
+pub struct AppState { // Make AppState public
     embedder: Arc<Embedder>,
     http_client: ClientWithMiddleware, // Add the cached client
     
