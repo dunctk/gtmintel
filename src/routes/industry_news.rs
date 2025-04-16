@@ -70,6 +70,8 @@ use serde::Deserialize;
 use std::error::Error;
 use utoipa::{ToSchema, IntoParams};
 use crate::AppState;
+use futures::future::join_all;
+use ua_generator::ua::spoof_ua;
 
 #[derive(Debug, Deserialize, ToSchema, IntoParams)]
 pub struct NewsQuery {
@@ -147,28 +149,42 @@ async fn get_news_from_feeds(days: u32, vertical: String, client: ClientWithMidd
         return Ok(Vec::new()); // Return empty list if no feeds match
     }
     
+    // Create a collection of futures
+    let feed_futures = filtered_feeds.iter().map(|&feed| {
+        let client_clone = client.clone(); // Clone client for each future
+        async move {
+            match fetch_and_parse_feed(feed, &client_clone).await {
+                Ok(items) => Ok((feed.name.clone(), items)), // Return feed name along with items for context
+                Err(e) => {
+                    eprintln!("Error fetching feed {}: {}", feed.name, e);
+                    Err((feed.name.clone(), e)) // Return feed name along with error
+                }
+            }
+        }
+    });
+
+    // Execute futures concurrently
+    let results = join_all(feed_futures).await;
+
     let mut all_items = Vec::new();
-    
-    // Iterate over the *filtered* feeds
-    for feed in filtered_feeds {
-        match fetch_and_parse_feed(&feed, &client).await {
-            Ok(mut items) => {
+    for result in results {
+        match result {
+            Ok((_feed_name, mut items)) => {
                 // Filter items by date
                 items.retain(|item| {
-                    // Attempt to parse the date
                     if let Ok(date) = DateTime::parse_from_rfc2822(&item.published).or_else(|_| DateTime::parse_from_rfc3339(&item.published)) {
                         date.with_timezone(&Utc) >= cutoff_date
                     } else {
-                        eprintln!("Could not parse date: {} for feed {}", item.published, feed.name);
+                        // Log unparseable dates but don't use feed name here as it's already logged in the future if there was an error
+                        eprintln!("Could not parse date: {} for item link {}", item.published, item.link);
                         false // Skip items with unparseable dates
                     }
                 });
-                
                 all_items.extend(items);
             }
-            Err(e) => {
-                eprintln!("Error fetching feed {}: {}", feed.name, e);
-                // Continue with other feeds
+            Err((feed_name, _e)) => {
+                // Error already logged in the future, potentially add more context here if needed
+                 eprintln!("Skipping results from feed {} due to previous error.", feed_name);
             }
         }
     }
@@ -184,7 +200,14 @@ async fn get_news_from_feeds(days: u32, vertical: String, client: ClientWithMidd
 }
 
 async fn fetch_and_parse_feed(feed: &Feed, client: &ClientWithMiddleware) -> Result<Vec<NewsItem>, Box<dyn Error + Send + Sync>> {
-    let response = client.get(&feed.rss).send().await?;
+    let user_agent = spoof_ua();
+    tracing::debug!("Fetching feed {} with User-Agent: {}", feed.rss, user_agent);
+
+    let response = client.get(&feed.rss)
+        .header(reqwest::header::USER_AGENT, user_agent)
+        .send()
+        .await?;
+
     let content = response.bytes().await?;
     
     let channel = Channel::read_from(&content[..])?;

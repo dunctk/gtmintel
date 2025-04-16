@@ -36,12 +36,6 @@
     "vertical": "ai"
   },
   {
-    "name": "AIModels.fyi",
-    "description": "Get a digest of new AI research, how-to guides, and top models.",
-    "rss": "https://aimodels.substack.com/feed",
-    "vertical": "ai"
-  },
-  {
     "name": "AI News",
     "description": "Artificial Intelligence News",
     "rss": "https://www.artificialintelligence-news.com/feed/rss/",
@@ -57,12 +51,6 @@
     "name": "AI Now Institute",
     "description": "The AI Now Institute produces diagnosis and actionable policy research on artificial intelligence.",
     "rss": "https://ainowinstitute.org/category/news/feed",
-    "vertical": "ai"
-  },
-  {
-    "name": "Ai Prompt Programming",
-    "description": "This group focuses on using AI tools like ChatGPT, OpenAI API, and other automated code generators for Ai programming & \u2026",
-    "rss": "https://www.reddit.com/r/aipromptprogramming",
     "vertical": "ai"
   },
   {
@@ -87,18 +75,6 @@
     "name": "Analytics India Magazine",
     "description": "Artificial Intelligence, Emerging Tech, Data Science",
     "rss": "https://analyticsindiamag.com/feed/",
-    "vertical": "ai"
-  },
-  {
-    "name": "Artificial Intelligence - Reddit",
-    "description": "Reddit's home for Artificial Intelligence",
-    "rss": "https://www.reddit.com/r/artificial",
-    "vertical": "ai"
-  },
-  {
-    "name": "Artificial intelligence (AI) \u2013 The Conversation",
-    "description": "Latest articles on AI from The Conversation",
-    "rss": "https://theconversation.com/europe/topics/artificial-intelligence-ai-90/articles.atom",
     "vertical": "ai"
   },
   {
@@ -152,7 +128,7 @@
   {
     "name": "OpenAI Blog",
     "description": "The OpenAI blog",
-    "rss": "https://openai.com/blog/rss/",
+    "rss": "https://openai.com/news/rss.xml/",
     "vertical": "ai"
   },
   {
