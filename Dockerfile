@@ -52,7 +52,8 @@ WORKDIR /app
 # Copy dynamically-linked binary from the standard release location in the builder stage
 COPY --from=builder /app/target/release/gtmintel /app/gtmintel
 
-
+# Copy the data file needed at runtime
+COPY src/data/feeds_ai.json /app/data/feeds_ai.json
 
 # Update package lists and install runtime libs
 # This ensures libssl.so.3 (or similar) and certificates are present

@@ -40,7 +40,7 @@ pub struct NewsResponse {
 }
 
 pub fn load_feeds() -> Result<Vec<Feed>, std::io::Error> {
-    let file = std::fs::File::open("src/data/feeds_ai.json")?;
+    let file = std::fs::File::open("/app/data/feeds_ai.json")?;
     let feeds: Vec<Feed> = serde_json::from_reader(file)?;
     Ok(feeds)
 }
