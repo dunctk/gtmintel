@@ -711,6 +711,34 @@ pub fn create_app() -> Router {
     tracing::info!("Loaded {} API key(s)", shared_api_keys.len());
     // --- End API Key Loading ---
 
+    // --- Load RapidAPI Secret ---
+    // Try to load from environment, then from .env file if already loaded
+    match std::env::var("RAPIDAPI_SECRET") {
+        Ok(secret) => {
+            if !secret.is_empty() {
+                tracing::info!("RapidAPI secret loaded from environment variable");
+            } else {
+                tracing::warn!("RapidAPI secret is empty");
+            }
+        },
+        Err(_) => {
+            // Try to load from .env if not already loaded by API_KEYS
+            match std::env::var("RAPIDAPI_SECRET") {
+                Ok(secret) => {
+                    if !secret.is_empty() {
+                        tracing::info!("RapidAPI secret loaded from .env file");
+                    } else {
+                        tracing::warn!("RapidAPI secret is empty");
+                    }
+                },
+                Err(_) => {
+                    tracing::warn!("RAPIDAPI_SECRET not found. RapidAPI authentication will not be available.");
+                }
+            }
+        }
+    }
+    // --- End RapidAPI Secret Loading ---
+
     let api_doc = ApiDoc::openapi();
     let shared_embedder = TEXT_EMBEDDER.clone();
     let shared_http_client = HTTP_CLIENT.clone();
@@ -2979,6 +3007,25 @@ async fn api_key_auth(
     req: Request,
     next: Next,
 ) -> Result<Response, impl IntoResponse> { // Return impl IntoResponse for error case
+    // Check for RapidAPI header first
+    let rapid_api_secret = req.headers()
+        .get("X-RapidAPI-Proxy-Secret")
+        .and_then(|value| value.to_str().ok());
+    
+    if let Some(secret) = rapid_api_secret {
+        // Validate against environment variable
+        if let Ok(expected_secret) = std::env::var("RAPIDAPI_SECRET") {
+            if secret == expected_secret {
+                tracing::trace!("Valid RapidAPI secret provided.");
+                return Ok(next.run(req).await);
+            }
+        }
+        // Invalid RapidAPI secret
+        tracing::warn!("Invalid RapidAPI secret provided.");
+        return Err((StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "Invalid RapidAPI Secret"}))));
+    }
+    
+    // Fall back to API key validation if RapidAPI header not present
     let provided_key = req.headers()
         .get("X-API-Key") // Common header for API keys
         .and_then(|value| value.to_str().ok());
@@ -2996,10 +3043,10 @@ async fn api_key_auth(
             Err((StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "Invalid API Key"}))))
         }
         None => {
-            // No key was provided
-            tracing::warn!("Missing API key.");
+            // No authentication was provided
+            tracing::warn!("Missing authentication.");
             // Return a clear error response
-            Err((StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "API Key required"}))))
+            Err((StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "Authentication required"}))))
         }
     }
 }
