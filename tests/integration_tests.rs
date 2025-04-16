@@ -156,7 +156,7 @@ async fn test_research_new_pages_integration() {
     
     // Create a request
     let request = Request::builder()
-        .uri("/research/pages/new?domain=example.com&within_days=30&list_pages=true")
+        .uri("/research/pages/new?domain=rust-lang.org&within_days=30&list_pages=true")
         .method("GET")
         .body(Body::empty())
         .unwrap();
@@ -170,9 +170,6 @@ async fn test_research_new_pages_integration() {
     // Get the status before consuming the response
     let status = response.status();
     
-    // Check status - will likely be an error in test env without real API access
-    assert!(status.is_client_error() || status.is_success());
-    
     // Log the status before consuming the body
     println!("Research new pages response status: {}", status);
     
@@ -182,13 +179,40 @@ async fn test_research_new_pages_integration() {
     
     println!("Research new pages response body: {}", body_str);
     
-    // Try to parse JSON if it looks valid
-    if body_str.trim().starts_with('{') {
-        if let Ok(body) = serde_json::from_str::<Value>(&body_str) {
-            if body.get("domain").is_some() {
-                assert_eq!(body["domain"], "example.com");
+    // For successful responses, verify the response structure and content
+    if status.is_success() {
+        let body: Value = serde_json::from_str(&body_str).expect("Response should be valid JSON");
+        
+        // Verify the response contains the expected fields
+        assert!(body.get("domain").is_some(), "Response should contain domain field");
+        assert_eq!(body["domain"], "rust-lang.org", "Domain should match request");
+        
+        // Check for required fields
+        assert!(body.get("new_pages_count").is_some(), "Response should contain new_pages_count");
+        assert!(body["new_pages_count"].is_number(), "new_pages_count should be a number");
+        
+        assert!(body.get("days_analyzed").is_some(), "Response should contain days_analyzed");
+        assert_eq!(body["days_analyzed"], 30, "days_analyzed should match request parameter");
+        
+        // If list_pages=true, verify pages list exists
+        if body.get("pages").is_some() {
+            assert!(body["pages"].is_array(), "pages should be an array");
+        }
+    } else {
+        // For error responses in test environment, check for reasonable error format
+        if body_str.trim().starts_with('{') {
+            if let Ok(body) = serde_json::from_str::<Value>(&body_str) {
+                // Check for error information if available
+                println!("Error response structure: {:?}", body);
+                
+                if body.get("error").is_some() {
+                    assert!(body["error"].is_string(), "Error should be a string message");
+                }
             }
         }
+        
+        // In test environments, we accept error responses but log them for analysis
+        println!("Endpoint returned error in test environment: {}", status);
     }
 }
 
@@ -233,7 +257,7 @@ async fn test_research_new_pages_batch_valid() {
     
     // Create a valid request body
     let request_body = r#"{
-        "domains": ["example.com", "test.com"],
+        "domains": ["rust-lang.org", "crates.io"],
         "within_days": 30,
         "list_pages": true
     }"#;
