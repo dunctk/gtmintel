@@ -51,14 +51,15 @@ pub struct AccessibilityIssue {
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct AccessibilityResponse {
-    /// URL that was scanned
-    url: String,
-    /// Whether the scan completed successfully
+    /// URL originally requested for the scan
+    requested_url: String,
+    /// Whether the overall scan process initiated successfully
     success: bool,
-    /// Number of issues found
-    issue_count: usize,
-    /// List of accessibility issues found
-    issues: Vec<AccessibilityIssue>,
+    /// Total number of issues found across all scanned pages
+    total_issue_count: usize,
+    /// Map where keys are the actual URLs scanned (including sub-pages if crawled)
+    /// and values are the list of issues found for that specific URL.
+    results_by_url: std::collections::HashMap<String, Vec<AccessibilityIssue>>,
 }
 
 /// Endpoint for scanning websites for accessibility issues
@@ -67,10 +68,10 @@ pub struct AccessibilityResponse {
     path = "/research/accessibility",
     params(AccessibilityQuery),
     responses(
-        (status = 200, description = "Success, audit complete", body = AccessibilityResponse),
+        (status = 200, description = "Success, audit complete, results grouped by URL", body = AccessibilityResponse),
         (status = 500, description = "Internal Server Error during processing")
     ),
-    description = "Scans a website for accessibility issues following WCAG guidelines. This is an authenticated endpoint."
+    description = "Scans a website (potentially multiple pages if crawled) for accessibility issues following WCAG guidelines. Results are grouped by the URL where issues were found. This is an authenticated endpoint."
 )]
 pub async fn scan_accessibility(
     Query(query): Query<AccessibilityQuery>,
@@ -87,14 +88,19 @@ pub async fn scan_accessibility(
     println!("Accessibility audit enum for {}: {:?}", query.url, audit_results_enum);
 
     // Process the AuditResults enum
-    let (success, issues) = match audit_results_enum {
-        // Match the Page variant which contains the HashMap
+    let (success, results_map) = match audit_results_enum {
         AuditResults::Page(page_data) => {
-            let mut extracted_issues: Vec<AccessibilityIssue> = Vec::new();
-            // Iterate directly over the HashMap
-            for (_url_key, page_issues) in page_data.iter() {
+            let mut extracted_results: std::collections::HashMap<String, Vec<AccessibilityIssue>> = std::collections::HashMap::new();
+
+            println!("[DEBUG] Processing page_data map. Number of URLs found: {}", page_data.len());
+
+            // Iterate directly over the HashMap from the audit result
+            for (url_key, page_issues) in page_data.iter() {
+                println!("[DEBUG] Processing issues for URL: {}", url_key);
+                let mut issues_for_this_url: Vec<AccessibilityIssue> = Vec::new();
+
                 for issue in page_issues {
-                    extracted_issues.push(AccessibilityIssue {
+                    issues_for_this_url.push(AccessibilityIssue {
                         context: issue.context.clone(),
                         selectors: issue.selectors.clone(),
                         code: issue.code.clone(),
@@ -110,23 +116,30 @@ pub async fn scan_accessibility(
                         recurrence: issue.recurrence as i32,
                     });
                 }
+                 println!("[DEBUG] Finished processing issues for URL: {}. Found {} issues.", url_key, issues_for_this_url.len());
+                // Insert the converted issues into our response map, keyed by URL
+                extracted_results.insert(url_key.clone(), issues_for_this_url);
             }
-            (true, extracted_issues) // Return success and the issues
+            println!("[DEBUG] Finished processing all URLs. Final map size: {}", extracted_results.len());
+            (true, extracted_results) // Return success and the map
         },
-        // Handle other potential variants if they exist
-        // Add more match arms here if needed based on the AuditResults definition
+         // Handle other potential variants
          _ => {
              eprintln!("Audit returned an unexpected variant for {}: {:?}", query.url, audit_results_enum);
-             (false, Vec::new()) // Indicate failure, return empty issues
+             // Return success=false and an empty map
+             (false, std::collections::HashMap::new())
          }
     };
 
+    // Calculate total issue count from the map values
+    let total_issues = results_map.values().map(|v| v.len()).sum();
+
     // Create our response
     let response = AccessibilityResponse {
-        url: query.url,
+        requested_url: query.url, // The URL the user initially requested
         success,
-        issue_count: issues.len(),
-        issues,
+        total_issue_count: total_issues,
+        results_by_url: results_map, // The map containing issues grouped by URL
     };
 
     // Return the response as JSON

@@ -575,6 +575,9 @@ async fn health_check() -> impl IntoResponse {
         routes::industry_news::NewsResponse,
         routes::industry_news::NewsQuery,
         routes::accessibility::AccessibilityQuery, // Add accessibility query
+        routes::accessibility::AccessibilityResponse, // Add/ensure this is present
+        routes::accessibility::AccessibilityIssue,
+        routes::accessibility::AccessibilityIssueExtras,
     ))
 )]
 struct ApiDoc;
