@@ -548,6 +548,7 @@ async fn health_check() -> impl IntoResponse {
         research_new_pages_batch, // Ensure batch endpoint is listed
         routes::content_suggestions::get_content_suggestions, // Add our new content suggestions route
         routes::industry_news::fetch_industry_news, // Add the industry news route
+        routes::accessibility::scan_accessibility, // Add accessibility endpoint
     ),
     components(schemas(
         ResearchQuery,
@@ -572,7 +573,8 @@ async fn health_check() -> impl IntoResponse {
         routes::content_suggestions::ContentSuggestionsQuery,
         routes::industry_news::NewsItem,
         routes::industry_news::NewsResponse,
-        routes::industry_news::NewsQuery
+        routes::industry_news::NewsQuery,
+        routes::accessibility::AccessibilityQuery, // Add accessibility query
     ))
 )]
 struct ApiDoc;
@@ -763,6 +765,7 @@ pub fn create_app() -> Router {
         .route("/research/pages/new/batch", post(research_new_pages_batch))
         .route("/research/content-suggestions", get(routes::content_suggestions::get_content_suggestions)) // Add our new route
         .route("/research/pages/new", get(research_new_pages)) // Add the missing route
+        .route("/research/accessibility", get(routes::accessibility::scan_accessibility)) // Add accessibility endpoint
         // Apply the authentication middleware to this group
         .route_layer(axum::middleware::from_fn_with_state(app_state.clone(), api_key_auth));
 
