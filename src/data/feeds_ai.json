@@ -148,5 +148,11 @@
     "description": "Weekly AI summaries and commentary",
     "rss": "https://lastweekin.ai/feed",
     "vertical": "ai"
+  },
+  {
+    "name": "Nature",
+    "description": "Nature is a international scientific journal published by Springer Nature.",
+    "rss": "https://www.nature.com/subjects/machine-learning.rss",
+    "vertical": "ai"
   }
 ]
