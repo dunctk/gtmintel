@@ -79,7 +79,8 @@ pub async fn scan_accessibility(
 ) -> impl IntoResponse {
     // Create accessibility config
     let mut config = AuditConfig::default();
-    config.url = query.url.clone();
+    config.url          = query.url.clone();
+    config.bounding_box = true;
 
     // Call audit directly - it returns AuditResults enum
     let audit_results_enum = audit(&config).await;

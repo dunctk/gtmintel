@@ -1,6 +1,7 @@
 // Add this line at the top of your lib.rs file, before any imports
 pub mod error;
 pub mod routes; // Add the routes module
+pub mod jobs; // expose background job modules
 
 // Then your existing imports can stay as they are
 use axum::{
