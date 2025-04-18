@@ -59,4 +59,4 @@ path = "src/main.rs"
 
 [[bin]]
 name = "gtmintel-worker" # new worker
-path = "src/worker.rs"
+path = "src/bin/worker.rs"

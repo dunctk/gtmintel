@@ -47,6 +47,9 @@ async fn main() {
         return;
     }
 
+    // Notify immediately that the worker has started and is scheduling
+    println!("industry-funding worker started; scheduling every 15 minutes");
+
     info!("industry‑funding worker starting; running every 15 minutes");
 
     let mut ticker = interval(Duration::from_secs(15 * 60));

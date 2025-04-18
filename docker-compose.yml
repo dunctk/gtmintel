@@ -5,6 +5,11 @@ services:
     build: .
     image: gtmintel:latest     # the image we just built
     command: ["/app/gtmintel"] # run the HTTP server
+    cap_add:
+      - SYS_ADMIN
+      - NET_ADMIN
+    security_opt:
+      - seccomp:unconfined
     ports:
       - "3000:3000"
     environment:
@@ -13,5 +18,10 @@ services:
   worker:
     image: gtmintel:latest     # reuse the same image
     command: ["/app/gtmintel-worker"]
+    cap_add:
+      - SYS_ADMIN
+      - NET_ADMIN
+    security_opt:
+      - seccomp:unconfined
     environment:
       - RUST_LOG=info          # whatever vars the worker needs
