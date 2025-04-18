@@ -5,14 +5,8 @@ use tracing_subscriber::FmtSubscriber;
 use tracing::Level;
 use gtmintel::jobs::run_industry_funding;
 use std::env;
-
-// Placeholder async job function. Replace its body with real logic that
-// fetches fresh market data from an external API and persists it to your
-// database.
-async fn fetch_market_data_and_store() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Delegate to the real job (days_back = 0)
-    run_industry_funding(0).await
-}
+use sea_orm::{Database, DatabaseConnection};
+use dotenvy::dotenv;
 
 #[tokio::main]
 async fn main() {
@@ -22,27 +16,43 @@ async fn main() {
         .finish();
     let _ = tracing::subscriber::set_global_default(subscriber);
 
-    // ---------------------------------------------------------------------------------
+    // Load .env (if present) so DATABASE_URL from file is visible
+    let _ = dotenv();
+
     // Command‑line flags
-    // ---------------------------------------------------------------------------------
     let args: Vec<String> = env::args().collect();
     let run_once = args.iter().any(|a| a == "--industry-funding");
 
+    // Establish DB connection (if DATABASE_URL is set) — optional for local runs
+    let db_conn: Option<DatabaseConnection> = match env::var("DATABASE_URL") {
+        Ok(url) => {
+            match Database::connect(&url).await {
+                Ok(conn) => Some(conn),
+                Err(e) => {
+                    error!(?e, "failed to connect to database");
+                    None
+                }
+            }
+        }
+        Err(_) => {
+            info!("DATABASE_URL not set; continuing without DB");
+            None
+        }
+    };
+
     if run_once {
-        // Immediate, single‑shot execution
-        if let Err(e) = fetch_market_data_and_store().await {
+        if let Err(e) = run_industry_funding(db_conn.as_ref(), 0).await {
             error!(?e, "industry‑funding job failed");
         }
-        return; // exit after one run
+        return;
     }
 
     info!("industry‑funding worker starting; running every 15 minutes");
 
-    // Schedule: every 15 minutes
     let mut ticker = interval(Duration::from_secs(15 * 60));
     loop {
-        ticker.tick().await; // Wait until the next instant
-        if let Err(e) = fetch_market_data_and_store().await {
+        ticker.tick().await;
+        if let Err(e) = run_industry_funding(db_conn.as_ref(), 0).await {
             error!(?e, "industry‑funding job failed");
         }
     }

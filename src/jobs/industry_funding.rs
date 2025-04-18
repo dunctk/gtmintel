@@ -22,6 +22,8 @@ use reqwest::Client;
 use std::{io::Cursor, time::Duration as StdDuration};
 use zip::ZipArchive;
 use std::env;
+use sea_orm::{DatabaseConnection, ActiveModelTrait, Set};
+use crate::entities::funding;          // ← module we just created
 
 const BASE_URL: &str = "http://data.gdeltproject.org/gdeltv2";
 
@@ -51,7 +53,10 @@ const LATE_STAGE_SKIP_PHRASES: &[&str] = &[
 /// Fetch the latest **early‑stage funding** rows from GDELT and print them.
 ///
 /// `days_back` lets callers rewind N days when back‑filling.
-pub async fn run_industry_funding(days_back: i64) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+pub async fn run_industry_funding(
+    conn: Option<&DatabaseConnection>,
+    days_back: i64,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let client = Client::builder()
         .timeout(StdDuration::from_secs(60))
         .build()?;
@@ -154,7 +159,25 @@ pub async fn run_industry_funding(days_back: i64) -> Result<(), Box<dyn std::err
             "early"
         };
 
-        println!("{} | {} | {} | {} | {}", ts, source, amt_snip, stage, url);
+        println!("{ts} | {source} | {amt_snip} | {stage} | {url}");
+
+        if let Some(db) = conn {
+            let am = funding::ActiveModel {
+                // id left unset ⇒ auto_increment
+                ts:         Set(ts.to_string()),
+                source:     Set(source.to_string()),
+                amount_text:Set(amt_snip.to_owned()),
+                stage:      Set(stage.to_owned()),
+                news_url:   Set(url.to_string()),
+                created_at: Set(Utc::now()),
+                ..Default::default()
+            };
+
+            if let Err(e) = am.insert(db).await {
+                tracing::error!("insert failed: {e}");
+            }
+        }
+
         hits += 1;
         if hits == 40 {
             println!("…truncated after 40 early‑stage hits…");
@@ -182,5 +205,5 @@ fn amount_under_50m(text: &str) -> bool {
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let args: Vec<String> = env::args().collect();
     let days_back: i64 = args.get(1).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
-    run_industry_funding(days_back).await
+    run_industry_funding(None, days_back).await
 }
