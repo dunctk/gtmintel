@@ -52,3 +52,11 @@ uuid = { version = "1.16.0", features = ["v4"] }
 [dev-dependencies]
 hyper = { version = "1.0", features = ["full"] }
 tower = { version = "0.5", features = ["util"] }
+
+[[bin]]
+name = "gtmintel"        # existing server
+path = "src/main.rs"
+
+[[bin]]
+name = "gtmintel-worker" # new worker
+path = "src/worker.rs"

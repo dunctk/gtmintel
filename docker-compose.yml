@@ -1,0 +1,17 @@
+version: "3.9"
+
+services:
+  api:
+    build: .
+    image: gtmintel:latest     # the image we just built
+    command: ["/app/gtmintel"] # run the HTTP server
+    ports:
+      - "3000:3000"
+    environment:
+      - PORT=3000
+
+  worker:
+    image: gtmintel:latest     # reuse the same image
+    command: ["/app/gtmintel-worker"]
+    environment:
+      - RUST_LOG=info          # whatever vars the worker needs

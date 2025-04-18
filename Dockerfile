@@ -38,7 +38,7 @@ RUN cargo chef cook --release --recipe-path recipe.json
 
 # 3B) Now copy the actual source code and build our final binary (for the native target)
 COPY . .
-RUN cargo build --release
+RUN cargo build --release --bin gtmintel --bin gtmintel-worker
 # The binary will be located at /app/target/release/gtmintel
 
 # -------------------------------------------------------
@@ -50,7 +50,8 @@ FROM debian:stable-slim AS runtime
 WORKDIR /app
 
 # Copy dynamically-linked binary from the standard release location in the builder stage
-COPY --from=builder /app/target/release/gtmintel /app/gtmintel
+COPY --from=builder /app/target/release/gtmintel         /app/gtmintel
+COPY --from=builder /app/target/release/gtmintel-worker  /app/gtmintel-worker
 
 # Copy the data file needed at runtime
 COPY src/data/feeds_ai.json /app/data/feeds_ai.json
