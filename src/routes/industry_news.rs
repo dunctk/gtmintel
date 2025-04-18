@@ -284,7 +284,7 @@ async fn get_article_markdown(url: &str, client: &ClientWithMiddleware) -> Resul
     let parsed_url = Url::parse(url)?;
     let product = extractor::extract(&mut html.as_bytes(), &parsed_url)?;
 
-    // Convert cleaned HTML -> Markdown
+    // Convert cleaned HTML -> Markdown using rewrite (false = disable heuristics)
     let markdown = html2md::rewrite_html(&product.content, false);
 
     Ok(markdown)
