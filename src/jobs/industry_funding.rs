@@ -24,6 +24,9 @@ use zip::ZipArchive;
 use std::env;
 use sea_orm::{DatabaseConnection, ActiveModelTrait, Set};
 use crate::entities::funding;          // ← module we just created
+use url::Url;
+use llm_readability::extractor;
+use reqwest::header;
 
 const BASE_URL: &str = "http://data.gdeltproject.org/gdeltv2";
 
@@ -49,6 +52,9 @@ const LATE_STAGE_SKIP_PHRASES: &[&str] = &[
     "debt round",
     "land sales",
 ];
+
+// Add a spoofed User-Agent
+const SPOOFED_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/109.0.0.0 Safari/537.36";
 
 /// Fetch the latest **early‑stage funding** rows from GDELT and print them.
 ///
@@ -161,6 +167,53 @@ pub async fn run_industry_funding(
 
         println!("{ts} | {source} | {amt_snip} | {stage} | {url}");
 
+        // ---- Fetch and process article content ----
+        let article_content = match Url::parse(url) {
+            Ok(parsed_url) => {
+                match client.get(parsed_url.clone()) // Clone parsed_url here
+                           .header(header::USER_AGENT, SPOOFED_USER_AGENT)
+                           .timeout(StdDuration::from_secs(30)) // Add timeout for article fetch
+                           .send()
+                           .await {
+                    Ok(resp) => {
+                        if resp.status().is_success() {
+                            match resp.bytes().await {
+                                Ok(html_bytes) => {
+                                    let mut cursor = Cursor::new(html_bytes);
+                                    match extractor::extract(&mut cursor, &parsed_url) { // Use parsed_url here
+                                        Ok(product) => {
+                                            // Convert readable HTML to Markdown
+                                            html2md::rewrite_html(&product.content, false)
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!("Readability failed for {}: {}", url, e);
+                                            String::new() // Empty string on readability error
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!("Failed to read bytes from {}: {}", url, e);
+                                    String::new() // Empty string on byte read error
+                                }
+                            }
+                        } else {
+                            tracing::warn!("HTTP error {} fetching article: {}", resp.status(), url);
+                            String::new() // Empty string on non-2xx status
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to fetch article {}: {}", url, e);
+                        String::new() // Empty string on network error
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Failed to parse URL {}: {}", url, e);
+                String::new() // Empty string on URL parse error
+            }
+        };
+        // ---- End fetch and process ----
+
         if let Some(db) = conn {
             let am = funding::ActiveModel {
                 // id left unset ⇒ auto_increment
@@ -169,6 +222,7 @@ pub async fn run_industry_funding(
                 amount_text:Set(amt_snip.to_owned()),
                 stage:      Set(stage.to_owned()),
                 news_url:   Set(url.to_string()),
+                article_content: Set(article_content),
                 created_at: Set(Utc::now()),
                 ..Default::default()
             };
