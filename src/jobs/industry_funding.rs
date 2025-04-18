@@ -173,8 +173,16 @@ pub async fn run_industry_funding(
                 ..Default::default()
             };
 
-            if let Err(e) = am.insert(db).await {
-                tracing::error!("insert failed: {e}");
+            match am.insert(db).await {
+                Ok(_) => {}
+                Err(e) => {
+                    let msg = e.to_string().to_lowercase();
+                    if msg.contains("unique") || msg.contains("duplicate") {
+                        tracing::warn!("Skipping duplicate news_url entry: {}", url);
+                    } else {
+                        tracing::error!("insert failed: {}", e);
+                    }
+                }
             }
         }
 
