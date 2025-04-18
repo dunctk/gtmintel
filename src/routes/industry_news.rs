@@ -29,6 +29,8 @@ pub struct NewsItem {
     pub description: Option<String>,
     /// Name of the source publication
     pub source: String,
+    /// The main article content converted to Markdown (best-effort, may be empty if extraction fails)
+    pub article_content: Option<String>,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
@@ -212,16 +214,30 @@ async fn fetch_and_parse_feed(feed: &Feed, client: &ClientWithMiddleware) -> Res
     
     let channel = Channel::read_from(&content[..])?;
     
-    let items = channel.items().iter().map(|item| {
-        NewsItem {
+    let mut items = Vec::new();
+    for item in channel.items() {
+        // Attempt to fetch and extract the full article content (best‑effort).
+        let link = item.link().unwrap_or("").to_string();
+
+        let article_content = match get_article_markdown(&link, client).await {
+            Ok(md) => Some(md),
+            Err(e) => {
+                // Log a warning and continue with blank content if extraction fails
+                tracing::warn!("Could not extract article content for {}: {}", link, e);
+                None
+            }
+        };
+
+        items.push(NewsItem {
             title: item.title().unwrap_or("Untitled").to_string(),
-            link: item.link().unwrap_or("").to_string(),
+            link,
             published: item.pub_date().unwrap_or("").to_string(),
             description: item.description().map(|s| s.to_string()),
             source: feed.name.clone(),
-        }
-    }).collect();
-    
+            article_content,
+        });
+    }
+
     Ok(items)
 }
 
@@ -236,5 +252,41 @@ pub fn create_cached_client() -> ClientWithMiddleware {
             options: HttpCacheOptions::default(),
         }))
         .build()
+}
+
+// -------------------------------- Private helpers --------------------------------
+
+use url::Url;
+use llm_readability::extractor;
+
+/// Fetch an article URL and return a Markdown version of its main content using llm_readability + fast_html2md.
+async fn get_article_markdown(url: &str, client: &ClientWithMiddleware) -> Result<String, Box<dyn Error + Send + Sync>> {
+    if url.is_empty() {
+        return Err("Empty URL".into());
+    }
+
+    // Use a realistic User‑Agent for the article fetch.
+    let user_agent = spoof_ua();
+
+    let response = client
+        .get(url)
+        .header(reqwest::header::USER_AGENT, user_agent)
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        return Err(format!("Non‑200 HTTP status {}", response.status()).into());
+    }
+
+    let html = response.text().await?;
+
+    // Readability extraction
+    let parsed_url = Url::parse(url)?;
+    let product = extractor::extract(&mut html.as_bytes(), &parsed_url)?;
+
+    // Convert cleaned HTML -> Markdown
+    let markdown = html2md::rewrite_html(&product.content, false);
+
+    Ok(markdown)
 }
 
