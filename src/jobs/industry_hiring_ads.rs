@@ -10,6 +10,13 @@ use dotenv::dotenv;
 // Import the entity and the helper struct for deserialization
 use crate::entities::hiring_ads::{self as hiring_ads_entity, JobListing};
 
+// List of substrings that, if found in a company website URL, will cause the job ad to be skipped.
+const FORBIDDEN_WEBSITE_SUBSTRINGS: &[&str] = &[
+    "workday",
+    "bit.ly",
+    // Add more forbidden substrings here in the future
+];
+
 /// Fetches job listings from Apify, performs basic processing, and saves to the database.
 pub async fn run_industry_hiring_ads(
     conn: Option<&DatabaseConnection>,
@@ -66,12 +73,45 @@ pub async fn run_industry_hiring_ads(
     let mut error_count = 0;
 
     // --- 2. Process and Save Listings --- 
-    for job in job_listings {
+    'job_loop: for job in job_listings {
         debug!("Processing job: {} @ {}", job.title, job.company_name);
+
+        // --- Filtering Logic ---
+        // 1. Exclude companies with more than 150 employees
+        if let Some(count) = job.company_employees_count {
+            if count > 150 {
+                debug!("Skipping job ({} @ {}): Company employees ({}) > 150", job.title, job.company_name, count);
+                skipped_count += 1;
+                continue 'job_loop;
+            }
+        }
+
+        // 2. Exclude jobs without a company website or with specific keywords
+        match &job.company_website {
+            None => {
+                debug!("Skipping job ({} @ {}): Missing company website", job.title, job.company_name);
+                skipped_count += 1;
+                continue 'job_loop;
+            }
+            Some(website) => {
+                let website_lower = website.to_lowercase();
+                // Check against the list of forbidden substrings
+                for forbidden in FORBIDDEN_WEBSITE_SUBSTRINGS {
+                    if website_lower.contains(forbidden) {
+                        debug!(
+                            "Skipping job ({} @ {}): Website contains forbidden substring '{}' ({})",
+                            job.title, job.company_name, forbidden, website
+                        );
+                        skipped_count += 1;
+                        continue 'job_loop; // Use labeled loop to break outer loop iteration
+                    }
+                }
+            }
+        }
+        // --- End Filtering Logic ---
 
         // --- Placeholder for Enrichment/Filtering --- 
         // TODO: Implement enrichment logic (e.g., categorize seniority, parse salary)
-        // TODO: Implement filtering logic (e.g., skip irrelevant roles/companies)
         let is_relevant_placeholder = Some(true); // Example: assume relevant for now
         let enrichment_data_placeholder: Option<Json> = None; // Example: no extra data yet
         // --- End Placeholder --- 
