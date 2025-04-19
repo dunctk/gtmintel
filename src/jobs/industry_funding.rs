@@ -142,6 +142,7 @@ async fn is_truly_early_stage(
     match response.json::<OpenAIResponse>().await {
          Ok(response_json) => {
             tracing::debug!("OpenAI Parsed Response: {:?}", response_json);
+            tracing::debug!(">>> OpenAI Raw Output: '{}'", response_json.output);
             Ok(response_json.output.trim().eq_ignore_ascii_case("YES"))
          }
          Err(e) => {
