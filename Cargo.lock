@@ -2472,6 +2472,7 @@ dependencies = [
  "backoff",
  "chrono",
  "csv",
+ "dotenv",
  "dotenvy",
  "embed_anything",
  "fast_html2md",

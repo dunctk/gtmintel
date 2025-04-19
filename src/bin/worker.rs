@@ -4,6 +4,7 @@ use tracing::{error, info};
 use tracing_subscriber::FmtSubscriber;
 use tracing::Level;
 use gtmintel::jobs::run_industry_funding;
+use gtmintel::jobs::run_industry_hiring_ads;
 use std::env;
 use sea_orm::{Database, DatabaseConnection};
 use dotenvy::dotenv;
@@ -22,6 +23,7 @@ async fn main() {
     // Command‑line flags
     let args: Vec<String> = env::args().collect();
     let run_once = args.iter().any(|a| a == "--industry-funding");
+    let run_hiring_once = args.iter().any(|a| a == "--industry-hiring-ads");
 
     // Establish DB connection (if DATABASE_URL is set) — optional for local runs
     let db_conn: Option<DatabaseConnection> = match env::var("DATABASE_URL") {
@@ -40,23 +42,39 @@ async fn main() {
         }
     };
 
+    // Run industry funding job once if flag is set
     if run_once {
         if let Err(e) = run_industry_funding(db_conn.as_ref(), 0).await {
-            error!(?e, "industry‑funding job failed");
+            error!(?e, "industry-funding job failed");
         }
         return;
     }
 
-    // Notify immediately that the worker has started and is scheduling
-    println!("industry-funding worker started; scheduling every 15 minutes");
+    // Run industry hiring job once if flag is set
+    if run_hiring_once {
+        if let Err(e) = run_industry_hiring_ads(db_conn.as_ref()).await {
+            error!(?e, "industry-hiring-ads job failed");
+        }
+        return;
+    }
 
-    info!("industry‑funding worker starting; running every 15 minutes");
+
+    info!("Worker starting; running jobs every 15 minutes");
 
     let mut ticker = interval(Duration::from_secs(15 * 60));
     loop {
         ticker.tick().await;
+        info!("Running scheduled jobs...");
+
+        // Run funding job
         if let Err(e) = run_industry_funding(db_conn.as_ref(), 0).await {
-            error!(?e, "industry‑funding job failed");
+            error!(?e, "industry-funding job failed");
         }
+
+        // Run hiring ads job
+        if let Err(e) = run_industry_hiring_ads(db_conn.as_ref()).await {
+            error!(?e, "industry-hiring-ads job failed");
+        }
+        info!("Scheduled jobs finished.");
     }
 } 
