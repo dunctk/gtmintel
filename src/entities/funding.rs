@@ -13,6 +13,7 @@ pub struct Model {
     pub news_url: String,
     pub created_at: DateTime<Utc>,
     pub article_content: String,
+    pub stage_checked: String,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
