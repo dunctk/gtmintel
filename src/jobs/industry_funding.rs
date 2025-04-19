@@ -69,6 +69,8 @@ async fn is_truly_early_stage(
     client: &Client,
     article_content: &str,
     news_url: &str,
+    headline: &str,
+    source: &str,
     endpoint: &str,
     api_key: &str,
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
@@ -86,15 +88,25 @@ async fn is_truly_early_stage(
         article_content
     };
 
-    let prompt = format!(
-        "Analyze the following news article content, considering its source URL. Does it definitively describe a seed, pre-seed, or angel funding round? Answer with only 'YES' or 'NO'.\n\nArticle:\n{}\n\nSource URL: {}",
-        truncated_content,
-        news_url
-    );
+    let prompt = if !article_content.is_empty() {
+        format!(
+            "Analyze the following news article content, considering its source URL. Does it definitively describe a seed, pre-seed, or angel funding round? Answer with only 'YES' or 'NO'.\n\nArticle:\n{}\n\nSource URL: {}",
+            truncated_content,
+            news_url
+        )
+    } else {
+        format!(
+            "Primary content extraction failed for the news article linked below (headline and source provided). Based *only* on the URL, headline, source domain, and any information you can access from the URL (e.g., via web search), does this article likely describe a seed, pre-seed, or angel funding round? Answer with only 'YES' or 'NO'.\n\nHeadline: {}\nSource: {}\nURL: {}",
+            headline,
+            source,
+            news_url
+        )
+    };
 
     let request_body = json!({
         "model": "gpt-4o", // Or your specific deployment name if not using the base model name
-        "input": prompt
+        "input": prompt,
+        "tools": [{ "type": "web_search_preview" }],
     });
 
     // Construct the full URL for the specific API endpoint
@@ -201,11 +213,16 @@ pub async fn run_industry_funding(
         let rec = result?;
         let fields: Vec<&str> = rec.iter().collect();
 
+        // Extract necessary fields early on
+        let ts = fields.get(1).unwrap_or(&" ");
+        let source = fields.get(3).unwrap_or(&"<src>");
+        let url_str = fields.get(4).unwrap_or(&"<url>"); // Rename to avoid clash later
+        let headline = fields.get(5).unwrap_or(&" "); // GDELT GKG v2 format: headline is field 5
         let v2themes = fields.get(8).unwrap_or(&" ");
         let extras = fields.get(26).unwrap_or(&" "); // Extras column often has amounts
-        let headline = fields.get(4).unwrap_or(&" ");
 
-        // Quickly drop records containing any skip phrases
+        // --- Filtering Logic ---
+        // Quickly drop records containing any skip phrases (in themes or headline)
         let themes_lower = v2themes.to_lowercase();
         let head_lower = headline.to_lowercase();
         if LATE_STAGE_SKIP_PHRASES.iter().any(|&p| themes_lower.contains(p))
@@ -214,7 +231,7 @@ pub async fn run_industry_funding(
             continue;
         }
 
-        // 1) Must look like a funding event (theme or regex)
+        // 1) Must look like a funding event (theme or regex in extras/headline)
         let theme_flag = FUNDING_TAGS.iter().any(|tag| v2themes.contains(tag));
         let regex_flag = funding_re.is_match(extras) || funding_re.is_match(headline);
         if !(theme_flag || regex_flag) {
@@ -227,31 +244,31 @@ pub async fn run_industry_funding(
         if !(early_flag_word || early_flag_amt) {
             continue; // likely later stage
         }
+        // --- End Filtering Logic ---
 
-        // Extract amount snippet for display (first match)
+        // Extract amount snippet for display (first match from extras or headline)
         let amt_snip = funding_re
             .find(extras)
             .or_else(|| funding_re.find(headline))
             .map(|m| m.as_str())
             .unwrap_or("n/a");
 
-        let ts = fields.get(1).unwrap_or(&" ");
-        let source = fields.get(3).unwrap_or(&"<src>");
-        let url = fields.get(4).unwrap_or(&"<url>");
+        // Determine initial stage guess based on keywords
         let stage = if early_flag_word {
             stage_re
                 .find(headline)
                 .or_else(|| stage_re.find(v2themes))
                 .map(|m| m.as_str())
-                .unwrap_or("early")
+                .unwrap_or("early") // Default if regex found but no specific stage word
         } else {
-            "early"
+            "early" // Default if only amount heuristic matched
         };
 
-        println!("{ts} | {source} | {amt_snip} | {stage} | {url}");
+        println!("{ts} | {source} | {amt_snip} | {stage} | {url_str}");
+
 
         // ---- Fetch and process article content ----
-        let article_content = match Url::parse(url) {
+        let article_content = match Url::parse(url_str) {
             Ok(parsed_url) => {
                 match client.get(parsed_url.clone()) // Clone parsed_url here
                            .header(header::USER_AGENT, SPOOFED_USER_AGENT)
@@ -269,77 +286,75 @@ pub async fn run_industry_funding(
                                             html2md::rewrite_html(&product.content, false)
                                         }
                                         Err(e) => {
-                                            tracing::warn!("Readability failed for {}: {}", url, e);
+                                            tracing::warn!("Readability failed for {}: {}", url_str, e);
                                             String::new() // Empty string on readability error
                                         }
                                     }
                                 }
                                 Err(e) => {
-                                    tracing::warn!("Failed to read bytes from {}: {}", url, e);
+                                    tracing::warn!("Failed to read bytes from {}: {}", url_str, e);
                                     String::new() // Empty string on byte read error
                                 }
                             }
                         } else {
-                            tracing::warn!("HTTP error {} fetching article: {}", resp.status(), url);
+                            tracing::warn!("HTTP error {} fetching article: {}", resp.status(), url_str);
                             String::new() // Empty string on non-2xx status
                         }
                     }
                     Err(e) => {
-                        tracing::warn!("Failed to fetch article {}: {}", url, e);
+                        tracing::warn!("Failed to fetch article {}: {}", url_str, e);
                         String::new() // Empty string on network error
                     }
                 }
             }
             Err(e) => {
-                tracing::warn!("Failed to parse URL {}: {}", url, e);
+                tracing::warn!("Failed to parse URL {}: {}", url_str, e);
                 String::new() // Empty string on URL parse error
             }
         };
         // ---- End fetch and process ----
 
-        // ---- Verify with OpenAI ----
+        // ---- Verify with OpenAI (always attempt) ----
         let mut is_confirmed_early = false; // Default to false unless verified
         let mut verification_performed = false; // Track if verification was attempted
 
-        // Only attempt verification if we have article content and credentials
-        if !article_content.is_empty() {
-            // Read Azure OpenAI credentials from environment variables
-            let openai_endpoint = env::var("AZURE_OPENAI_ENDPOINT");
-            let openai_api_key = env::var("AZURE_OPENAI_API_KEY");
+        // Read Azure OpenAI credentials from environment variables
+        let openai_endpoint = env::var("AZURE_OPENAI_ENDPOINT");
+        let openai_api_key = env::var("AZURE_OPENAI_API_KEY");
 
-            match (openai_endpoint, openai_api_key) {
-                (Ok(endpoint), Ok(api_key)) => {
-                    if !endpoint.is_empty() && !api_key.is_empty() {
-                         verification_performed = true;
-                         match is_truly_early_stage(&client, &article_content, url, &endpoint, &api_key).await { // Pass url here
-                            Ok(confirmed) => {
-                                is_confirmed_early = confirmed;
-                                if confirmed {
-                                    println!(">>> OpenAI confirmed early stage for: {}", url);
+        match (openai_endpoint, openai_api_key) {
+            (Ok(endpoint), Ok(api_key)) => {
+                if !endpoint.is_empty() && !api_key.is_empty() {
+                     verification_performed = true;
+                     // Pass url_str, headline, source along with content
+                     match is_truly_early_stage(&client, &article_content, url_str, headline, source, &endpoint, &api_key).await {
+                        Ok(confirmed) => {
+                            is_confirmed_early = confirmed;
+                            if confirmed {
+                                println!(">>> OpenAI confirmed early stage for: {}", url_str);
+                            } else {
+                                if !article_content.is_empty() {
+                                     println!(">>> OpenAI did NOT confirm early stage for: {}", url_str);
                                 } else {
-                                     // Only log non-confirmation if content wasn't empty initially
-                                    println!(">>> OpenAI did NOT confirm early stage for: {}", url);
+                                     println!(">>> OpenAI did NOT confirm early stage (based on URL/meta) for: {}", url_str);
                                 }
                             }
-                            Err(e) => {
-                                tracing::error!("OpenAI verification failed for {}: {}", url, e);
-                                // Decide behavior on API error: skip or proceed without confirmation?
-                                // Defaulting to skip (is_confirmed_early remains false)
-                            }
                         }
-                    } else {
-                        tracing::warn!("AZURE_OPENAI_ENDPOINT or AZURE_OPENAI_API_KEY is empty. Skipping OpenAI verification.");
-                        // is_confirmed_early remains false
+                        Err(e) => {
+                            tracing::error!("OpenAI verification failed for {}: {}", url_str, e);
+                            // Decide behavior on API error: skip or proceed without confirmation?
+                            // Defaulting to skip (is_confirmed_early remains false)
+                        }
                     }
-                }
-                _ => {
-                    tracing::warn!("AZURE_OPENAI_ENDPOINT or AZURE_OPENAI_API_KEY not set. Skipping OpenAI verification.");
+                } else {
+                    tracing::warn!("AZURE_OPENAI_ENDPOINT or AZURE_OPENAI_API_KEY is empty. Skipping OpenAI verification.");
                     // is_confirmed_early remains false
                 }
             }
-        } else {
-             println!(">>> Skipping OpenAI verification due to empty article content for: {}", url);
-             // is_confirmed_early remains false
+            _ => {
+                tracing::warn!("AZURE_OPENAI_ENDPOINT or AZURE_OPENAI_API_KEY not set. Skipping OpenAI verification.");
+                // is_confirmed_early remains false
+            }
         }
         // ---- End OpenAI verification ----
 
@@ -357,7 +372,7 @@ pub async fn run_industry_funding(
                     source: Set(source.to_string()),
                     amount_text: Set(amt_snip.to_owned()),
                     stage: Set(stage.to_owned()), // Keep original stage guess? Or update?
-                    news_url: Set(url.to_string()),
+                    news_url: Set(url_str.to_string()), // Use url_str here
                     article_content: Set(article_content), // Store full content even if truncated for prompt
                     created_at: Set(Utc::now()),
                     stage_checked: Set(stage_checked_value), // Set the new column
@@ -376,7 +391,7 @@ pub async fn run_industry_funding(
                     Err(e) => {
                         let msg = e.to_string().to_lowercase();
                         if msg.contains("unique") || msg.contains("duplicate") {
-                            tracing::warn!("Skipping duplicate (already inserted?) news_url entry: {}", url);
+                            tracing::warn!("Skipping duplicate (already inserted?) news_url entry: {}", url_str);
                         } else {
                             tracing::error!("DB insert failed: {}", e);
                         }
@@ -384,7 +399,7 @@ pub async fn run_industry_funding(
              }
         } else {
              // If no DB connection, just print the determined stage?
-             println!("   Determined stage (not saving to DB): {} | URL: {}", stage_checked_value, url);
+             println!("   Determined stage (not saving to DB): {} | URL: {}", stage_checked_value, url_str);
              // Optionally increment hits here if you want to count non-DB confirmed items
              // if is_confirmed_early { hits += 1; }
         }
